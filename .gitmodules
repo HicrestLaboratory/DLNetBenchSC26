@@ -1,0 +1,3 @@
+[submodule "DLNetBench/DLNetBench"]
+	path = DLNetBench/DLNetBench
+	url = https://github.com/HicrestLaboratory/DLNetBench.git
