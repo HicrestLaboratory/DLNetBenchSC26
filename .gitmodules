@@ -5,3 +5,6 @@
 	path = common/ccutils
 	url = git@github.com:ThomasPasquali/ccutils.git
 	branch = ccutils_json
+[submodule "common/JobPlacer"]
+	path = common/JobPlacer
+	url = https://github.com/HicrestLaboratory/JobPlacer.git
