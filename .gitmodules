@@ -1,3 +1,7 @@
 [submodule "DLNetBench/DLNetBench"]
 	path = DLNetBench/DLNetBench
 	url = https://github.com/HicrestLaboratory/DLNetBench.git
+[submodule "common/ccutils"]
+	path = common/ccutils
+	url = git@github.com:ThomasPasquali/ccutils.git
+	branch = ccutils_json
