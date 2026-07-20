@@ -1,0 +1,2091 @@
+"""
+Multi-Training Congestion: Experiment Design Framework
+======================================================
+Python implementation of the formalization by Thomas Pasquali.
+
+Structure:
+  - Section 1:  System model (GPU count, strategies, feasibility sets)
+  - Section 2:  Baseline set B  (extended with topology placements when enabled)
+  - Section 3:  GPU allocation patterns  (families A / B / C / D / E)
+  - Section 4:  Strategy assignment & entropy-stratified sampling
+  - Section 5:  Final experiment set  E
+  - Section 6:  Network topology model & placement-class sampling
+  - Section 7:  TopologyOracle  – thin wrapper around the external topology program
+  - Section 8:  Extended experiment set  E_hier
+  - Section 9:  Pretty-printing / summary utilities
+  - Section 10: JSON serialization
+
+Configure everything in the CONFIG block at the top of this file.
+
+Controllable experiment-set size
+---------------------------------
+--max-experiments is a **hard upper bound** on the number of entries in the
+final output list (hierarchical experiments when --use-topology is set, flat
+experiments otherwise).  The budget is enforced by two complementary
+mechanisms:
+
+  1. A shared ExperimentBudget counter is passed into every builder; each
+     builder stops as soon as the counter is exhausted.
+
+  2. Inside each builder, samples are drawn in *round-robin* order across
+     entropy/placement bins so that the cap produces a well-balanced slice
+     of the design space rather than exhausting one bin first.
+
+--n-samples-per-bin        caps labellings per entropy bin per pattern.
+--n-placement-samples-per-bin caps placement-class vectors per locality bin
+                            per flat experiment.
+
+The two per-bin knobs therefore control *density* (how many samples per
+cell), while --max-experiments controls *breadth* (how many cells are
+visited).
+
+Sorted output
+-------------
+The final experiment list is sorted so that running experiments in order
+and stopping early (due to a crash or time limit) still yields maximally
+varied results.
+
+For flat experiments the sort key cycles through:
+  entropy_bin (low → medium → high) × pattern_family × pattern
+
+For hierarchical experiments the sort key cycles through the JOINT
+(placement_bin × entropy_bin) grid in a diagonal / round-robin stripe:
+
+  combined_bin_index = placement_bin_idx * 3 + entropy_bin_idx
+
+  i.e. the nine cells are visited in this order:
+    (low-P, low-H)   → index 0
+    (low-P, med-H)   → index 1
+    (low-P, high-H)  → index 2
+    (med-P, low-H)   → index 3
+    …
+    (high-P, high-H) → index 8
+
+  Secondary: pattern_family → pattern slots (for determinism)
+
+This guarantees that stopping at any prefix always covers all entropy bins
+across all placement bins, rather than exhausting one placement bin before
+moving to the next.
+
+Per-strategy placement classes
+-------------------------------
+Each parallelism strategy may only be scheduled under a subset of placement
+classes.  The mapping is defined in STRATEGY_PLACEMENT_MAP (below).  For each
+class the capacity constraint (max GPUs that fit under one L1-switch or one
+group) is checked at experiment-generation time; infeasible (strategy, size,
+class) triples are silently dropped.
+
+Placement-class vocabulary
+--------------------------
+  INTRA_L1_RANDOM     – all GPUs within one L1-switch, nodes chosen at random
+  INTRA_GROUP_RANDOM  – all GPUs within one group,    nodes chosen at random
+  INTER_GROUP_RANDOM  – GPUs may span multiple groups, nodes chosen at random
+  INTRA_GROUP_SAME_L1 – every DP replica placed on the *same* L1-switch,
+                        all L1-switches within a single group  (annotation 1)
+  INTER_GROUP_SAME_L1 – every DP replica placed on its own L1-switch,
+                        L1-switches drawn from *different* groups  (annotation 2)
+
+Add/rename/remove entries freely in PLACEMENT_CLASS_DEFS and
+STRATEGY_PLACEMENT_MAP; the rest of the code uses only those two tables.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import math
+import random
+import subprocess
+import json
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime, timezone
+
+# ===========================================================================
+# CONFIG  –  edit this block to customise the experiment design
+# ===========================================================================
+
+# ── Hardware ────────────────────────────────────────────────────────────────
+G: int = 72                # Total number of GPUs in the cluster
+
+# ── Pattern generation ───────────────────────────────────────────────────────
+G_MIN: int = 8
+K_MAX: int = math.floor(G / G_MIN)
+GEOMETRIC_BETA: float = 0.5
+
+# ── Strategies ──────────────────────────────────────────────────────────────
+STRATEGY_DEFS: list[tuple[str, list[int]]] = [
+    ("DP",           [8, 16]),              # Nodes: 2, 4
+    ("FSDP",         [16, 32]),             # Nodes: 4, 8
+    ("DP+PP",        [16, 32, 64]),         # Nodes: 4, 8, 16
+    ("DP+PP+TP",     [224, 256, 512]),      # Nodes: 56, 64, 128
+    ("DP+PP+Expert", [512, 1024]),          # Nodes: 128, 256
+]
+
+STRATEGY_DEFS_EXTENDED: list[tuple[str, list[int]]] = [
+    ("DP",           [8, 16, 32, 64]),            # Nodes: 2, 4, 8, 16
+    ("FSDP",         [16, 32, 64, 128, 256]),     # Nodes: 4, 8, 32, 64
+    ("DP+PP",        [16, 32, 64, 128, 256]),     # Nodes: 4, 8, 16, 32, 64
+    ("DP+PP+TP",     [224, 256, 512, 1024]),      # Nodes: 56, 64, 128, 256
+    ("DP+PP+Expert", [512, 1024, 2048]),          # Nodes: 128, 256, 512
+]
+
+STRATEGY_DEFS_EXTENDED_8GPUS_NODE: list[tuple[str, list[int]]] = [
+    ("DP",           [16, 32, 64, 128]),            # Nodes: 2, 4, 8, 16
+    ("FSDP",        [16, 32, 64, 128, 256, 512]),     # Nodes: 4, 8, 16, 32, 64
+    ("DP+PP",        [16, 32, 64, 128, 256, 512]),     # Nodes: 4, 8, 16, 32, 64
+    ("DP+PP+TP",     [224, 256, 512, 1024, 2048]),      # Nodes: 56, 64, 128, 256
+    ("DP+PP+Expert", [512, 1024, 2048, 4096]),          # Nodes: 128, 256, 512
+]
+
+
+STRATEGY_DEFS_DGX_A100: list[tuple[str, list[int]]] = [
+    ("DP",           [2, 4, 8]),
+    ("FSDP",         [4, 8]),
+    ("DP+PP",        [4, 8]),
+]
+
+HIERARCHICAL_PATTERNS: list[tuple[list[float], int]] = [
+    ([0.50, 0.25], 4),
+    ([0.05, 0.21], 6),
+    ([0.89],       4),
+]
+
+POWERLAW_ALPHAS: list[float] = [1.2]
+
+UTIL_MIN:   float = 0.8
+UTIL_MAX:   float = 1.0
+UTIL_STEPS: int   = 1
+
+STOCHASTIC_TIER_CONFIG: dict[str, dict] = {
+    "small": {
+        "tier_weight": 0.75,
+        "sizes": [4, 8],
+        "sub_weights": {4: 0.8},
+    },
+    "medium": {
+        "tier_weight": 0.20,
+        "sizes": [16, 32, 64, 512],
+        "sub_weights": {512: 0.25},
+    },
+    "large": {
+        "tier_weight": 0.05,
+        "sizes": [1024],
+        "sub_weights": {},
+    },
+}
+
+N_STOCHASTIC_PATTERNS: int = 3
+
+# ── Entropy-stratified sampling ──────────────────────────────────────────────
+ENTROPY_DELTA_1: float = 0.3
+ENTROPY_DELTA_2: float = 0.7
+N_SAMPLES_PER_BIN: int = 4
+ENUM_THRESHOLD: int = 5_000
+RANDOM_SEED: Optional[int] = 42
+
+# ── Experiment list size bounds ───────────────────────────────────────────────
+MIN_EXPERIMENTS: int = 0
+MAX_EXPERIMENTS: Optional[int] = None
+
+# ── Topology (Section 6) ─────────────────────────────────────────────────────
+USE_TOPOLOGY: bool = False
+
+TOPOLOGY_PROGRAM: str = "topology_oracle"
+
+# Static topology parameters
+# Leonardo
+TOPO_Q1: int = 4             # GPUs per intra-node NVLink domain  (unused after removing INTRA_NODE)
+TOPO_Q2: int = 10 * TOPO_Q1  # GPUs per L1-switch
+TOPO_Q3: int = 180 * TOPO_Q1 # GPUs per group (set equal to G for single-group clusters)
+
+# ---------------------------------------------------------------------------
+# Placement-class vocabulary
+# ---------------------------------------------------------------------------
+# Each entry: (class_name, human_label, score)
+#
+#   class_name   – internal key used everywhere in the code
+#   human_label  – shown in JSON / console output
+#   score        – numeric locality score (lower = tighter locality)
+#
+# Remove INTRA_NODE; add or rename entries freely here.
+# ---------------------------------------------------------------------------
+PLACEMENT_CLASS_DEFS: list[tuple[str, str, float]] = [
+    # name                        label                      score
+    ("INTRA_L1_RANDOM",           "intra-l1",                1.0),
+    ("INTRA_GROUP_RANDOM",        "intra-group",             2.0),
+    ("INTER_GROUP_RANDOM",        "inter-group",             3.0),
+    ("INTRA_GROUP_SAME_L1_2",     "intra-group-same-l1-2",   1.5), 
+    ("INTRA_GROUP_SAME_L1_4",     "intra-group-same-l1-4",   1.2), 
+    ("INTER_GROUP_SAME_L1_2",     "inter-group-same-l1-2",   2.5), 
+    ("INTER_GROUP_SAME_L1_4",     "inter-group-same-l1-4",   2.25),
+]
+
+# ---------------------------------------------------------------------------
+# Per-strategy placement-class mapping
+# ---------------------------------------------------------------------------
+# Each strategy name maps to the list of placement-class *names* (keys from
+# PLACEMENT_CLASS_DEFS) that are allowed for that strategy.
+#
+# Capacity constraints are enforced automatically based on the placement
+# class's semantics (see _placement_class_capacity() below).  If a job's
+# GPU count exceeds the capacity of a class, that (strategy, size, class)
+# triple is silently dropped.
+#
+# Edit freely – adding a new strategy or a new class only requires updating
+# these two tables.
+# ---------------------------------------------------------------------------
+STRATEGY_PLACEMENT_MAP: dict[str, list[str]] = {
+    # Strategy       Allowed placement-class names
+    "DP":            ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_RANDOM",
+                      "INTER_GROUP_RANDOM"],
+
+    "FSDP":          ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_SAME_L1_2",
+                      "INTER_GROUP_SAME_L1_2"],
+
+    "DP+PP":         ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_SAME_L1_2",
+                      "INTER_GROUP_SAME_L1_2",
+                      "INTER_GROUP_RANDOM"],
+
+    "DP+PP+TP":      ["INTRA_GROUP_SAME_L1_4",
+                      "INTER_GROUP_SAME_L1_4",
+                      "INTER_GROUP_RANDOM"],
+
+    "DP+PP+Expert":  ["INTRA_GROUP_RANDOM",
+                      "INTER_GROUP_RANDOM"],
+}
+
+STRATEGY_PLACEMENT_MAP_EXTENDED: dict[str, list[str]] = {
+    # Strategy       Allowed placement-class names
+    "DP":            ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_RANDOM",
+                      "INTER_GROUP_RANDOM"],
+
+    "FSDP":          ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_SAME_L1_2",
+                      "INTER_GROUP_SAME_L1_2",
+                      "INTRA_GROUP_RANDOM", 
+                      "INTER_GROUP_RANDOM"],
+
+    "DP+PP":         ["INTRA_L1_RANDOM",
+                      "INTRA_GROUP_SAME_L1_2",
+                      "INTER_GROUP_SAME_L1_2",
+                      "INTER_GROUP_RANDOM",
+                      "INTRA_GROUP_RANDOM"],
+
+    "DP+PP+TP":      ["INTRA_GROUP_SAME_L1_4",
+                      "INTER_GROUP_SAME_L1_4",
+                      "INTER_GROUP_RANDOM",
+                      "INTRA_GROUP_RANDOM"],
+
+    "DP+PP+Expert":  ["INTRA_GROUP_RANDOM",
+                      "INTER_GROUP_RANDOM"],
+}
+
+# Placement-vector scoring and bin boundaries.
+PLACEMENT_BIN_LO_HI:  float = 1.67
+PLACEMENT_BIN_MED_HI: float = 2.33
+
+N_BASELINE_TOPO_REPS: int = 0
+N_PLACEMENT_SEEDS_PER_VECTOR: int = 1
+N_PLACEMENT_SAMPLES_PER_BIN: int = 1
+PLACEMENT_ENUM_THRESHOLD: int = 50_000
+
+# ── JSON output ──────────────────────────────────────────────────────────────
+DEFAULT_JSON_OUTPUT: str = "experiments.json"
+
+
+# ===========================================================================
+# SECTION 1 – Data structures
+# ===========================================================================
+
+@dataclass(frozen=True)
+class PlacementClassInfo:
+    """Immutable descriptor for one placement class."""
+    name: str          # internal key
+    label: str         # human-readable label
+    score: float       # numeric locality score
+
+
+def _build_placement_registry(
+    defs: list[tuple[str, str, float]],
+) -> dict[str, PlacementClassInfo]:
+    return {name: PlacementClassInfo(name, label, score) for name, label, score in defs}
+
+
+# Module-level registry – rebuilt when the config changes via CLI.
+_PLACEMENT_REGISTRY: dict[str, PlacementClassInfo] = _build_placement_registry(
+    PLACEMENT_CLASS_DEFS
+)
+
+
+@dataclass(frozen=True)
+class Strategy:
+    name: str
+    feasible: frozenset[int]
+
+    def supports(self, g: int) -> bool:
+        return g in self.feasible
+
+
+@dataclass(frozen=True)
+class SingleRun:
+    strategy: Strategy
+    gpus: int
+
+    def __str__(self) -> str:
+        return f"({self.strategy.name}:{self.gpus})"
+
+
+@dataclass
+class Config:
+    runs: list[SingleRun]
+    cfg: argparse.Namespace
+
+    @property
+    def total_gpus(self) -> int:
+        return sum(r.gpus for r in self.runs)
+
+    @property
+    def utilization(self) -> float:
+        return self.total_gpus / self.cfg.G
+
+    @property
+    def k(self) -> int:
+        return len(self.runs)
+
+    def __str__(self) -> str:
+        slots = ", ".join(str(r) for r in self.runs)
+        return f"[{slots}]\n  util={int(self.utilization*100):3}% nodes: {int(self.total_gpus/4)} ({int(self.total_gpus)} GPUs)"
+
+
+# ===========================================================================
+# Budget tracking – shared mutable counter
+# ===========================================================================
+
+class ExperimentBudget:
+    """
+    Hard cap on the number of experiments that may be emitted across all
+    builders.  Pass the *same* instance into every builder so that the
+    cap is enforced globally.
+
+    When max_experiments is None the budget is unlimited.
+    """
+
+    def __init__(self, max_experiments: Optional[int]) -> None:
+        self._max = max_experiments
+        self._used = 0
+
+    @property
+    def unlimited(self) -> bool:
+        return self._max is None
+
+    @property
+    def remaining(self) -> int:
+        if self._max is None:
+            return 2 ** 62
+        return max(0, self._max - self._used)
+
+    @property
+    def exhausted(self) -> bool:
+        return not self.unlimited and self._used >= self._max  # type: ignore[operator]
+
+    def consume(self, n: int = 1) -> bool:
+        """Claim n slots.  Returns True if the claim was granted."""
+        if self.unlimited:
+            self._used += n
+            return True
+        if self._used + n > self._max:  # type: ignore[operator]
+            return False
+        self._used += n
+        return True
+
+    def __repr__(self) -> str:
+        return f"ExperimentBudget(used={self._used}, max={self._max})"
+
+
+# ===========================================================================
+# SECTION 2 – Baseline set  B
+# ===========================================================================
+
+def build_strategies(defs: list[tuple[str, list[int]]]) -> list[Strategy]:
+    return [Strategy(name, frozenset(gpus)) for name, gpus in defs]
+
+
+def build_baseline_set(
+    strategies: list[Strategy], g_total: int, strict: bool = True
+) -> list[SingleRun]:
+    baseline: list[SingleRun] = []
+    for s in strategies:
+        for g in sorted(s.feasible):
+            if strict:
+                if g < g_total:
+                    baseline.append(SingleRun(s, g))
+            else:
+                if g <= g_total:
+                    baseline.append(SingleRun(s, g))
+    return baseline
+
+
+@dataclass
+class BaselineWithPlacement:
+    """
+    A baseline run annotated with a topology placement class and a seed.
+    """
+    run: SingleRun
+    placement_class: str      # placement class *name* (key in _PLACEMENT_REGISTRY)
+    replicate_index: int
+    seed: int
+
+    def __str__(self) -> str:
+        label = _PLACEMENT_REGISTRY[self.placement_class].label
+        return (
+            f"  {str(self.run):<30}  class={label:<22}  "
+            f"rep={self.replicate_index}  seed={self.seed}"
+        )
+
+
+def build_baseline_set_with_topology(
+    strategies: list[Strategy],
+    g_total: int,
+    oracle: "TopologyOracle",
+    n_baseline_topo_reps: int,
+    base_seed: int = 0,
+) -> list[BaselineWithPlacement]:
+    flat_baseline = build_baseline_set(strategies, g_total)
+    result: list[BaselineWithPlacement] = []
+    seed_ctr = base_seed
+
+    for run in flat_baseline:
+        classes_in_scope = _feasible_placement_classes_for_run(
+            run.strategy, run.gpus, g_total, oracle
+        )
+        for pc_name in classes_in_scope:
+            result.append(BaselineWithPlacement(
+                run=run,
+                placement_class=pc_name,
+                replicate_index=0,
+                seed=seed_ctr,
+            ))
+            seed_ctr += 1
+
+            # Extra replicates for cross-group classes
+            pc_info = _PLACEMENT_REGISTRY[pc_name]
+            n_reps = (
+                n_baseline_topo_reps
+                if pc_info.score >= PLACEMENT_BIN_LO_HI
+                else 0
+            )
+            for rep in range(1, n_reps + 1):
+                result.append(BaselineWithPlacement(
+                    run=run,
+                    placement_class=pc_name,
+                    replicate_index=rep,
+                    seed=seed_ctr,
+                ))
+                seed_ctr += 1
+
+    return result
+
+
+# ===========================================================================
+# SECTION 3 – GPU Allocation Patterns
+# ===========================================================================
+
+AllocationPattern = tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TaggedPattern:
+    slots: AllocationPattern
+    family: str
+    pattern_id: str = ""   # e.g. "A1", "E3" – assigned by build_pattern_set
+
+    def __len__(self) -> int:
+        return len(self.slots)
+
+    def __iter__(self):
+        return iter(self.slots)
+
+    def __getitem__(self, idx):
+        return self.slots[idx]
+
+
+def compute_feasible_gpu_counts(
+    strategies: list[Strategy],
+    g_total: int,
+) -> frozenset[int]:
+    counts: set[int] = set()
+    for s in strategies:
+        for g in s.feasible:
+            if g < g_total:
+                counts.add(g)
+    return frozenset(counts)
+
+
+def _snap_down(raw: int, feasible: frozenset[int]) -> Optional[int]:
+    candidates = [g for g in feasible if g <= raw]
+    return max(candidates) if candidates else None
+
+
+def pattern_A_equal_splits(
+    g_total: int, k_max: int, g_min: int,
+    feasible_gpu_counts: frozenset[int], utilization: float = 1.0,
+) -> list[TaggedPattern]:
+    budget = int(math.floor(utilization * g_total))
+    patterns: list[TaggedPattern] = []
+    for k in range(2, k_max + 1):
+        if budget % k == 0:
+            g = budget // k
+            if g >= g_min and g in feasible_gpu_counts:
+                patterns.append(TaggedPattern(slots=tuple([g] * k), family="A"))
+    return patterns
+
+
+def pattern_B_geometric(
+    g_total: int, k_max: int, g_min: int, beta: float,
+    feasible_gpu_counts: frozenset[int], utilization: float = 1.0,
+) -> list[TaggedPattern]:
+    budget = int(math.floor(utilization * g_total))
+    patterns: list[TaggedPattern] = []
+    g1 = budget // 2
+    while g1 >= g_min:
+        slots: list[int] = []
+        remaining = budget
+        g_curr = g1
+        while len(slots) < k_max:
+            if g_curr < g_min:
+                break
+            snapped = _snap_down(g_curr, feasible_gpu_counts)
+            if snapped is None or snapped < g_min or snapped > remaining:
+                break
+            slots.append(snapped)
+            remaining -= snapped
+            g_curr = max(g_min, int(math.floor(beta * g_curr)))
+        if len(slots) >= 2:
+            patterns.append(TaggedPattern(slots=tuple(slots), family="B"))
+        g1 = g1 // 2
+    return patterns
+
+
+def pattern_C_hierarchical(
+    g_total: int, k_max: int, g_min: int,
+    tier_fractions: list[float], n_tiny: int,
+    feasible_gpu_counts: frozenset[int], utilization: float = 1.0,
+) -> Optional[TaggedPattern]:
+    budget = int(math.floor(utilization * g_total))
+    slots: list[int] = []
+    residual = budget
+    for alpha in tier_fractions:
+        raw = int(math.floor(alpha * residual))
+        snapped = _snap_down(raw, feasible_gpu_counts)
+        if snapped is None or snapped < g_min:
+            return None
+        slots.append(snapped)
+        residual -= snapped
+    if n_tiny > 0 and residual > 0:
+        raw_tiny = int(math.floor(residual / n_tiny))
+        snapped_tiny = _snap_down(raw_tiny, feasible_gpu_counts)
+        if snapped_tiny is None or snapped_tiny < g_min:
+            return None
+        slots.extend([snapped_tiny] * n_tiny)
+    if len(slots) < 2 or len(slots) > k_max or sum(slots) > g_total:
+        return None
+    return TaggedPattern(slots=tuple(slots), family="C")
+
+
+def pattern_D_powerlaw(
+    g_total: int, k: int, g_min: int, alpha: float,
+    utilization: float, feasible_gpu_counts: frozenset[int],
+) -> Optional[TaggedPattern]:
+    if alpha <= 1.0:
+        raise ValueError(f"alpha must be > 1, got {alpha}")
+    budget = int(math.floor(utilization * g_total))
+    raw = [j ** (-alpha) for j in range(1, k + 1)]
+    total_raw = sum(raw)
+    slots: list[int] = []
+    for w in raw:
+        raw_size = int(math.floor(w / total_raw * budget))
+        snapped = _snap_down(raw_size, feasible_gpu_counts)
+        if snapped is None or snapped < g_min:
+            return None
+        slots.append(snapped)
+    if sum(slots) > g_total or len(slots) < 2:
+        return None
+    return TaggedPattern(slots=tuple(slots), family="D")
+
+
+def _tier_size_weights(
+    tier_name: str, tier_cfg: dict, feasible_gpu_counts: frozenset[int],
+) -> tuple[list[int], list[float]]:
+    all_sizes: list[int] = tier_cfg["sizes"]
+    sub_weights_map: dict[int, float] = tier_cfg.get("sub_weights", {})
+    sizes = [s for s in all_sizes if s in feasible_gpu_counts]
+    if not sizes:
+        raise ValueError(f"Tier '{tier_name}' has no feasible sizes.")
+    pinned = {s: sub_weights_map[s] for s in sizes if s in sub_weights_map}
+    free = [s for s in sizes if s not in pinned]
+    total_pinned = sum(pinned.values())
+    if total_pinned > 1.0 + 1e-9:
+        raise ValueError(f"Sub-weights for tier '{tier_name}' exceed 1.0.")
+    rem_prob = (1.0 - total_pinned) / len(free) if free else 0.0
+    weights = [pinned[s] if s in pinned else rem_prob for s in sizes]
+    total_w = sum(weights)
+    if total_w <= 0:
+        raise ValueError(f"All weights zero for tier '{tier_name}'.")
+    return sizes, [w / total_w for w in weights]
+
+
+def pattern_E_stochastic_tier(
+    g_total: int, k_max: int, g_min: int,
+    tier_config: dict[str, dict], feasible_gpu_counts: frozenset[int],
+    rng: random.Random, utilization: float = 1.0,
+) -> Optional[TaggedPattern]:
+    tier_names = list(tier_config.keys())
+    total_tw = sum(tier_config[t]["tier_weight"] for t in tier_names)
+    if abs(total_tw - 1.0) > 1e-9:
+        raise ValueError("Tier weights must sum to 1.0.")
+
+    tier_size_info: dict[str, tuple[list[int], list[float]]] = {}
+    surviving_tiers: list[str] = []
+    surviving_tw: list[float] = []
+    for t in tier_names:
+        try:
+            sizes, weights = _tier_size_weights(t, tier_config[t], feasible_gpu_counts)
+            tier_size_info[t] = (sizes, weights)
+            surviving_tiers.append(t)
+            surviving_tw.append(tier_config[t]["tier_weight"])
+        except ValueError:
+            pass
+    if not surviving_tiers:
+        return None
+    total_stw = sum(surviving_tw)
+    surviving_tw = [w / total_stw for w in surviving_tw]
+
+    budget = int(math.floor(utilization * g_total))
+    slots: list[int] = []
+    remaining = budget
+    while remaining >= g_min and len(slots) < k_max:
+        any_fits = any(s <= remaining for t in surviving_tiers for s in tier_size_info[t][0])
+        if not any_fits:
+            break
+        tier = rng.choices(surviving_tiers, weights=surviving_tw, k=1)[0]
+        sizes, weights = tier_size_info[tier]
+        g = rng.choices(sizes, weights=weights, k=1)[0]
+        if g <= remaining:
+            slots.append(g)
+            remaining -= g
+    if len(slots) < 2:
+        return None
+    return TaggedPattern(slots=tuple(sorted(slots, reverse=True)), family="E")
+
+
+def pattern_E_stochastic_tier_batch(
+    g_total: int, k_max: int, g_min: int,
+    tier_config: dict[str, dict], feasible_gpu_counts: frozenset[int],
+    n_patterns: int, rng: random.Random, utilization: float = 1.0,
+) -> list[TaggedPattern]:
+    seen: set[AllocationPattern] = set()
+    patterns: list[TaggedPattern] = []
+    for _ in range(10 * n_patterns):
+        if len(patterns) >= n_patterns:
+            break
+        p = pattern_E_stochastic_tier(
+            g_total, k_max, g_min, tier_config, feasible_gpu_counts, rng,
+            utilization=utilization,
+        )
+        if p is not None and p.slots not in seen:
+            seen.add(p.slots)
+            patterns.append(p)
+    return patterns
+
+
+# ===========================================================================
+# SECTION 4 – Strategy Assignment & Entropy-Stratified Sampling
+# ===========================================================================
+
+ENTROPY_BIN_NAMES   = ("low", "medium", "high")
+PLACEMENT_BIN_NAMES = ("low", "medium", "high")
+FAMILY_NAMES = ("A", "B", "C", "D", "E")
+
+
+def build_pattern_set(
+    g_total: int, k_max: int, g_min: int, beta: float,
+    hierarchical_defs: list[tuple[list[float], int]],
+    powerlaw_alphas: list[float], utilizations: list[float],
+    util_min: float, util_max: float,
+    stochastic_tier_config: dict[str, dict], n_stochastic_patterns: int,
+    feasible_gpu_counts: frozenset[int], rng: random.Random,
+    generate_equal_splits: bool, generate_geometric: bool,
+    generate_hierarchical: bool, generate_powerlaw: bool,
+    generate_stochastic: bool,
+) -> list[TaggedPattern]:
+    seen: set[AllocationPattern] = set()
+    # Collect raw (un-named) patterns first, grouped by family so we can
+    # assign sequential per-family IDs (A1, A2, …, E1, E2, …) and then
+    # interleave families for uniform sampling.
+    by_family: dict[str, list[TaggedPattern]] = {f: [] for f in FAMILY_NAMES}
+
+    def add(tp: TaggedPattern) -> bool:
+        actual_util = sum(tp.slots) / g_total
+        if (tp.slots not in seen and sum(tp.slots) <= g_total
+                and util_min <= actual_util <= util_max):
+            seen.add(tp.slots)
+            by_family[tp.family].append(tp)
+            return True
+        return False
+
+    for rho in utilizations:
+        if generate_equal_splits:
+            for tp in pattern_A_equal_splits(g_total, k_max, g_min, feasible_gpu_counts, rho):
+                add(tp)
+
+        if generate_geometric:
+            for tp in pattern_B_geometric(g_total, k_max, g_min, beta, feasible_gpu_counts, rho):
+                add(tp)
+
+        if generate_hierarchical:
+            for tf, nt in hierarchical_defs:
+                tp = pattern_C_hierarchical(
+                    g_total, k_max, g_min, tf, nt, feasible_gpu_counts, rho
+                )
+                if tp is not None:
+                    add(tp)
+
+        if generate_powerlaw:
+            for alpha in powerlaw_alphas:
+                for k in range(2, k_max + 1):
+                    tp = pattern_D_powerlaw(g_total, k, g_min, alpha, rho, feasible_gpu_counts)
+                    if tp is not None:
+                        add(tp)
+
+        if generate_stochastic:
+            for tp in pattern_E_stochastic_tier_batch(
+                g_total, k_max, g_min, stochastic_tier_config,
+                feasible_gpu_counts, n_stochastic_patterns, rng, utilization=rho,
+            ):
+                add(tp)
+
+    # Assign per-family sequential IDs: A1, A2, …, E1, E2, …
+    named: dict[str, list[TaggedPattern]] = {}
+    for fam, raw_list in by_family.items():
+        named[fam] = []
+        for idx, tp in enumerate(raw_list, start=1):
+            named[fam].append(TaggedPattern(
+                slots=tp.slots,
+                family=tp.family,
+                pattern_id=f"{fam}{idx}",
+            ))
+
+    # Interleave families round-robin so that if patterns are later capped
+    # the resulting subset covers all families uniformly (e.g. A1, B1, C1,
+    # E1, A2, B2, … rather than all A's first, then all B's, etc.)
+    patterns: list[TaggedPattern] = []
+    queues = [named[f] for f in FAMILY_NAMES if named[f]]
+    any_left = True
+    while any_left:
+        any_left = False
+        for q in queues:
+            if q:
+                any_left = True
+                patterns.append(q.pop(0))
+
+    return patterns
+
+
+def feasible_strategies_for_slot(strategies: list[Strategy], g: int) -> list[Strategy]:
+    return [s for s in strategies if s.supports(g)]
+
+
+def mixture_entropy(labelling: list[Strategy], pattern: AllocationPattern) -> float:
+    rho = sum(pattern) / G
+    if rho == 0:
+        return 0.0
+    gpu_per_strategy: dict[str, int] = {}
+    for strat, g in zip(labelling, pattern):
+        gpu_per_strategy[strat.name] = gpu_per_strategy.get(strat.name, 0) + g
+    entropy = 0.0
+    for g_s in gpu_per_strategy.values():
+        p_tilde = (g_s / G) / rho
+        if p_tilde > 0:
+            entropy -= p_tilde * math.log(p_tilde)
+    return entropy
+
+
+def entropy_bin(h: float, m_feasible: int, k: int,
+                delta1_frac: float, delta2_frac: float) -> str:
+    effective_m = min(k, m_feasible)
+    h_max = math.log(effective_m) if effective_m > 1 else 1.0
+    d1, d2 = delta1_frac * h_max, delta2_frac * h_max
+    if h < d1:
+        return "low"
+    elif h < d2:
+        return "medium"
+    return "high"
+
+
+def _labelling_space_size(per_slot: list[list[Strategy]], threshold: int) -> int:
+    size = 1
+    for opts in per_slot:
+        size *= len(opts)
+        if size > threshold:
+            return size
+    return size
+
+
+def _random_labelling(per_slot: list[list[Strategy]], rng: random.Random) -> list[Strategy]:
+    return [rng.choice(opts) for opts in per_slot]
+
+
+def _labelling_canonical_key(lab: list, pattern: AllocationPattern) -> tuple:
+    return tuple(sorted(zip((s.name for s in lab), pattern)))
+
+
+def _sample_exact(per_slot, pattern, n_per_bin, m_feasible, k, d1, d2, rng):
+    bins: dict[str, list] = {b: [] for b in ENTROPY_BIN_NAMES}
+    seen: set[tuple] = set()
+    for combo in itertools.product(*per_slot):
+        lab = list(combo)
+        canon = _labelling_canonical_key(lab, pattern)
+        if canon in seen:
+            continue
+        seen.add(canon)
+        b = entropy_bin(mixture_entropy(lab, pattern), m_feasible, k, d1, d2)
+        bins[b].append(lab)
+    result = []
+    for bn in ENTROPY_BIN_NAMES:
+        for lab in rng.sample(bins[bn], min(n_per_bin, len(bins[bn]))):
+            result.append((lab, bn))
+    return result
+
+
+def _sample_rejection(per_slot, pattern, n_per_bin, m_feasible, k, d1, d2, rng):
+    bins: dict[str, list] = {b: [] for b in ENTROPY_BIN_NAMES}
+    seen: set[tuple] = set()
+    budget = n_per_bin * 200 * len(ENTROPY_BIN_NAMES)
+    for _ in range(budget):
+        if all(len(bins[b]) >= n_per_bin for b in ENTROPY_BIN_NAMES):
+            break
+        lab = _random_labelling(per_slot, rng)
+        key = _labelling_canonical_key(lab, pattern)
+        if key in seen:
+            continue
+        seen.add(key)
+        b = entropy_bin(mixture_entropy(lab, pattern), m_feasible, k, d1, d2)
+        if len(bins[b]) < n_per_bin:
+            bins[b].append(lab)
+    result = []
+    for bn in ENTROPY_BIN_NAMES:
+        for lab in bins[bn]:
+            result.append((lab, bn))
+    return result
+
+
+def sample_labellings_stratified(
+    pattern: TaggedPattern, strategies: list[Strategy],
+    n_per_bin: int, delta1_frac: float, delta2_frac: float,
+    enum_threshold: int, rng: random.Random,
+) -> list[tuple[list[Strategy], str]]:
+    per_slot = [feasible_strategies_for_slot(strategies, g) for g in pattern.slots]
+    if any(len(opts) == 0 for opts in per_slot):
+        return []
+    m_feasible = len({s.name for opts in per_slot for s in opts})
+    k = len(pattern.slots)
+    space = _labelling_space_size(per_slot, enum_threshold)
+    if space <= enum_threshold:
+        return _sample_exact(per_slot, pattern.slots, n_per_bin, m_feasible, k,
+                             delta1_frac, delta2_frac, rng)
+    return _sample_rejection(per_slot, pattern.slots, n_per_bin, m_feasible, k,
+                             delta1_frac, delta2_frac, rng)
+
+
+# ===========================================================================
+# SECTION 5 – Final Experiment Set  E
+# ===========================================================================
+
+@dataclass
+class Experiment:
+    pattern: TaggedPattern
+    labelling: list[Strategy]
+    entropy_bin: str
+    config: Config
+
+    def __str__(self) -> str:
+        return (
+            f"  pattern={str(self.pattern.slots)}\n"
+            f"  H-bin={self.entropy_bin}\n"
+            f"  config={str(self.config)}\n"
+        )
+
+
+def build_experiment_set(
+    cfg: argparse.Namespace,
+    patterns: list[TaggedPattern],
+    strategies: list[Strategy],
+    n_per_bin: int,
+    delta1_frac: float,
+    delta2_frac: float,
+    enum_threshold: int,
+    rng: random.Random,
+    budget: ExperimentBudget,
+) -> list[Experiment]:
+    """
+    Build the flat experiment set with round-robin bin interleaving.
+
+    Sampling order: for each pattern, collect up to n_per_bin candidates per
+    entropy bin, then emit them in round-robin bin order (low, medium, high,
+    low, …) so the global cap produces a balanced slice.
+    """
+    experiments: list[Experiment] = []
+
+    for pattern in patterns:
+        if budget.exhausted:
+            break
+
+        sampled_raw = sample_labellings_stratified(
+            pattern, strategies, n_per_bin,
+            delta1_frac, delta2_frac, enum_threshold, rng,
+        )
+        if not sampled_raw:
+            continue
+
+        # Group candidates by entropy bin.
+        by_bin: dict[str, list] = {b: [] for b in ENTROPY_BIN_NAMES}
+        for labelling, bin_label in sampled_raw:
+            by_bin[bin_label].append(labelling)
+
+        # Emit round-robin across bins until budget exhausted.
+        queues = [by_bin[b] for b in ENTROPY_BIN_NAMES]
+        bin_labels = list(ENTROPY_BIN_NAMES)
+        any_left = True
+        while any_left and not budget.exhausted:
+            any_left = False
+            for q, bl in zip(queues, bin_labels):
+                if not q:
+                    continue
+                any_left = True
+                if budget.exhausted:
+                    break
+                labelling = q.pop(0)
+                runs = [SingleRun(s, g) for s, g in zip(labelling, pattern.slots)]
+                experiments.append(Experiment(
+                    pattern=pattern,
+                    labelling=labelling,
+                    entropy_bin=bl,
+                    config=Config(runs, cfg),
+                ))
+                budget.consume(1)
+
+    return experiments
+
+
+# ===========================================================================
+# SECTION 6 – Network Topology Model & Placement Classification
+# ===========================================================================
+
+def _placement_class_capacity(
+    pc_name: str,
+    oracle: "TopologyOracle",
+) -> int:
+    q2: int = oracle.topology_params["q2"]
+    q3: int = oracle.topology_params["q3"]
+
+    capacities: dict[str, int] = {
+        "INTRA_L1_RANDOM":    q2,
+        "INTRA_GROUP_RANDOM": q3,
+        "INTER_GROUP_RANDOM": 2 ** 62,
+        "INTRA_GROUP_SAME_L1": q3,
+        "INTER_GROUP_SAME_L1": 2 ** 62,
+    }
+    return capacities.get(pc_name, 2 ** 62)
+
+
+def _feasible_placement_classes_for_run(
+    strategy: Strategy,
+    gpu_count: int,
+    g_total: int,
+    oracle: "TopologyOracle",
+) -> list[str]:
+    allowed: list[str] = STRATEGY_PLACEMENT_MAP.get(strategy.name, [])
+    def correct_placement(s):
+        global TOPO_Q1
+        if s in ["INTRA_GROUP_SAME_L1_4", "INTER_GROUP_SAME_L1_4"]:
+            return gpu_count > 4*TOPO_Q1
+        if s in ["INTRA_GROUP_SAME_L1_2", "INTER_GROUP_SAME_L1_2"]:
+            return gpu_count > 2*TOPO_Q1
+        return True
+    allowed = list(filter(correct_placement, allowed))
+    feasible: list[str] = []
+    for pc_name in allowed:
+        if pc_name not in _PLACEMENT_REGISTRY:
+            continue
+        cap = _placement_class_capacity(pc_name, oracle)
+        if gpu_count <= cap:
+            feasible.append(pc_name)
+    return feasible
+
+
+PlacementClassVector = tuple[str, ...]
+
+
+def placement_vector_score(kappa: PlacementClassVector) -> float:
+    if not kappa:
+        return 0.0
+    return sum(_PLACEMENT_REGISTRY[c].score for c in kappa if c in _PLACEMENT_REGISTRY) / len(kappa)
+
+
+def placement_bin(score: float, lo_hi: float, med_hi: float) -> str:
+    if score < lo_hi:
+        return "low"
+    elif score < med_hi:
+        return "medium"
+    return "high"
+
+
+def _placement_score_distribution(per_slot_classes: list[list[str]]) -> dict[int, int]:
+    def _int_score(pc_name: str) -> int:
+        return round(_PLACEMENT_REGISTRY[pc_name].score * 2)
+
+    dp: dict[int, int] = {0: 1}
+    for classes in per_slot_classes:
+        new_dp: dict[int, int] = {}
+        for prev_sum, cnt in dp.items():
+            for c in classes:
+                s = prev_sum + _int_score(c)
+                new_dp[s] = new_dp.get(s, 0) + cnt
+        dp = new_dp
+    return dp
+
+
+def _sample_placement_vectors_stratified(
+    per_slot_classes: list[list[str]],
+    n_per_bin: int,
+    lo_hi: float,
+    med_hi: float,
+    rng: random.Random,
+    enum_threshold: int = PLACEMENT_ENUM_THRESHOLD,
+) -> list[tuple[PlacementClassVector, str]]:
+    k = len(per_slot_classes)
+    if k == 0:
+        return []
+    if any(len(cl) == 0 for cl in per_slot_classes):
+        return []
+
+    total_vecs = 1
+    for classes in per_slot_classes:
+        total_vecs *= len(classes)
+        if total_vecs > enum_threshold:
+            break
+
+    if total_vecs <= enum_threshold:
+        bins: dict[str, list[PlacementClassVector]] = {"low": [], "medium": [], "high": []}
+        for kappa in itertools.product(*per_slot_classes):
+            b = placement_bin(placement_vector_score(kappa), lo_hi, med_hi)
+            bins[b].append(kappa)
+        result: list[tuple[PlacementClassVector, str]] = []
+        for bn in ("low", "medium", "high"):
+            for kappa in rng.sample(bins[bn], min(n_per_bin, len(bins[bn]))):
+                result.append((kappa, bn))
+        return result
+
+    dp = _placement_score_distribution(per_slot_classes)
+    bin_populations: dict[str, int] = {"low": 0, "medium": 0, "high": 0}
+    for score_sum_x2, cnt in dp.items():
+        b = placement_bin(score_sum_x2 / (k * 2), lo_hi, med_hi)
+        bin_populations[b] += cnt
+
+    needed_bins = [b for b in ("low", "medium", "high")
+                   if bin_populations[b] > 0 and n_per_bin > 0]
+    if not needed_bins:
+        return []
+
+    total_vecs_exact = sum(dp.values())
+    p_min = min(bin_populations[b] / total_vecs_exact for b in needed_bins)
+    safety_factor = 10
+    max_attempts = min(
+        int(math.ceil(n_per_bin / max(p_min, 1e-9))) * safety_factor,
+        500_000,
+    )
+
+    collected: dict[str, list[PlacementClassVector]] = {"low": [], "medium": [], "high": []}
+    seen: set[PlacementClassVector] = set()
+
+    for _ in range(max_attempts):
+        if all(
+            len(collected[b]) >= n_per_bin or bin_populations[b] == 0
+            for b in ("low", "medium", "high")
+        ):
+            break
+        kappa: PlacementClassVector = tuple(
+            rng.choice(classes) for classes in per_slot_classes
+        )
+        if kappa in seen:
+            continue
+        score = placement_vector_score(kappa)
+        b = placement_bin(score, lo_hi, med_hi)
+        if len(collected[b]) < n_per_bin:
+            collected[b].append(kappa)
+            seen.add(kappa)
+
+    result = []
+    for bn in ("low", "medium", "high"):
+        for kappa in collected[bn]:
+            result.append((kappa, bn))
+    return result
+
+
+# ===========================================================================
+# SECTION 7 – TopologyOracle
+# ===========================================================================
+
+class TopologyOracle:
+    """Thin wrapper around the external topology analysis program."""
+
+    def __init__(
+        self,
+        program: str = TOPOLOGY_PROGRAM,
+        q1: int = TOPO_Q1,
+        q2: int = TOPO_Q2,
+        q3: int = TOPO_Q3,
+    ) -> None:
+        self.program = program
+        self.topology_params = {"q1": q1, "q2": q2, "q3": q3}
+        self._available = self._check_available()
+
+    def _check_available(self) -> bool:
+        try:
+            result = subprocess.run([self.program, "--ping"], capture_output=True, timeout=2)
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _query(self, payload: dict) -> dict:
+        if not self._available:
+            return self._stub_response(payload)
+        try:
+            proc = subprocess.run(
+                [self.program], input=json.dumps(payload),
+                capture_output=True, text=True, timeout=10,
+            )
+            return json.loads(proc.stdout)
+        except Exception as exc:
+            print(f"[TopologyOracle] Warning: query failed ({exc}), using stub.")
+            return self._stub_response(payload)
+
+    def _stub_response(self, payload: dict) -> dict:
+        cmd = payload.get("command", "")
+        if cmd == "find_placement":
+            jobs = payload.get("jobs", [])
+            return {
+                "feasible": True,
+                "assignments": [
+                    {"job_id": j["job_id"],
+                     "nodes": [f"node-{j['job_id']}-{n}"
+                               for n in range(max(1, j["gpu_count"] // 8))]}
+                    for j in jobs
+                ],
+            }
+        if cmd == "shuffle_within_class":
+            jobs = payload.get("jobs", [])
+            n = payload.get("n_shuffles", 1)
+            single = [
+                {"job_id": j["job_id"],
+                 "nodes": [f"node-{j['job_id']}-shuf-{n}"
+                           for _ in range(max(1, j["gpu_count"] // 8))]}
+                for j in jobs
+            ]
+            return {"shuffles": [single] * n}
+        return {}
+
+    def find_placement(self, jobs: list[dict]) -> dict:
+        return self._query({"command": "find_placement", "jobs": jobs})
+
+    def shuffle_within_class(self, jobs: list[dict], n_shuffles: int = 3) -> list[list[dict]]:
+        resp = self._query({"command": "shuffle_within_class",
+                            "jobs": jobs, "n_shuffles": n_shuffles})
+        return resp.get("shuffles", [])
+
+
+# ===========================================================================
+# SECTION 8 – Extended Experiment Set  E_hier
+# ===========================================================================
+
+@dataclass
+class HierarchicalExperiment:
+    """X = (P, φ, κ, seed) – one element of E_hier."""
+    base: Experiment
+    placement_class_vector: PlacementClassVector
+    placement_bin_label: str
+    placement_score: float
+    placement_seed: int
+
+    def __str__(self) -> str:
+        labels = [
+            _PLACEMENT_REGISTRY[c].label if c in _PLACEMENT_REGISTRY else c
+            for c in self.placement_class_vector
+        ]
+        return (
+            f"{self.base}"
+            f"  κ={labels}"
+            f"  P-bin={self.placement_bin_label}"
+            f"  score={self.placement_score:.2f}"
+            f"  seed={self.placement_seed}\n"
+        )
+
+
+def build_hierarchical_experiment_set(
+    flat_experiments: list[Experiment],
+    oracle: "TopologyOracle",
+    n_placement_samples_per_bin: int,
+    placement_bin_lo_hi: float,
+    placement_bin_med_hi: float,
+    g_total: int,
+    rng: random.Random,
+    base_seed: int = 10_000,
+    n_seeds_per_vector: int = 1,
+    budget: Optional[ExperimentBudget] = None,
+) -> list[HierarchicalExperiment]:
+    """
+    Build E_hier with round-robin interleaving across *both* entropy bins and
+    placement bins, enforcing a hard budget cap.
+
+    The key insight: if we feed flat experiments to the per-experiment
+    placement sampler in their raw (generation) order, the budget cap fires
+    before we reach experiments from under-represented entropy bins.  We
+    therefore first reorder the flat list round-robin by entropy bin so that
+    each successive group of experiments covers all available H-bins before
+    repeating any.  Within each flat experiment we then emit placement vectors
+    round-robin across placement bins, giving a joint (H-bin × P-bin) stripe
+    that maximises variety under early truncation.
+    """
+    if budget is None:
+        budget = ExperimentBudget(None)
+
+    # ── Step 1: interleave flat experiments by entropy bin ───────────────────
+    # This ensures the hierarchical builder sees alternating H-bins so that
+    # the budget cap produces a balanced H-bin distribution.
+    by_hbin: dict[str, list[Experiment]] = {b: [] for b in ENTROPY_BIN_NAMES}
+    for exp in flat_experiments:
+        by_hbin[exp.entropy_bin].append(exp)
+    interleaved: list[Experiment] = []
+    hbin_queues = [by_hbin[b] for b in ENTROPY_BIN_NAMES]
+    any_left = True
+    while any_left:
+        any_left = False
+        for q in hbin_queues:
+            if q:
+                any_left = True
+                interleaved.append(q.pop(0))
+
+    # ── Step 2: for each flat experiment emit placement vectors round-robin ──
+    hier_experiments: list[HierarchicalExperiment] = []
+    seed_ctr = base_seed
+
+    for exp in interleaved:
+        if budget.exhausted:
+            break
+
+        per_slot_classes: list[list[str]] = [
+            _feasible_placement_classes_for_run(
+                run.strategy, run.gpus, g_total, oracle
+            )
+            for run in exp.config.runs
+        ]
+
+        if any(len(cl) == 0 for cl in per_slot_classes):
+            continue
+
+        sampled = _sample_placement_vectors_stratified(
+            per_slot_classes=per_slot_classes,
+            n_per_bin=n_placement_samples_per_bin,
+            lo_hi=placement_bin_lo_hi,
+            med_hi=placement_bin_med_hi,
+            rng=rng,
+        )
+
+        # Group by placement bin, then emit round-robin.
+        by_pbin: dict[str, list[PlacementClassVector]] = {b: [] for b in PLACEMENT_BIN_NAMES}
+        for kappa, p_bin in sampled:
+            by_pbin[p_bin].append(kappa)
+
+        queues = [by_pbin[b] for b in PLACEMENT_BIN_NAMES]
+        pbin_labels = list(PLACEMENT_BIN_NAMES)
+        any_left = True
+        while any_left and not budget.exhausted:
+            any_left = False
+            for q, pb in zip(queues, pbin_labels):
+                if not q:
+                    continue
+                any_left = True
+                if budget.exhausted:
+                    break
+                kappa = q.pop(0)
+                score = placement_vector_score(kappa)
+                for _ in range(n_seeds_per_vector):
+                    if budget.exhausted:
+                        break
+                    hier_experiments.append(HierarchicalExperiment(
+                        base=exp,
+                        placement_class_vector=kappa,
+                        placement_bin_label=pb,
+                        placement_score=round(score, 4),
+                        placement_seed=seed_ctr,
+                    ))
+                    seed_ctr += 1
+                    budget.consume(1)
+
+    return hier_experiments
+
+
+# ===========================================================================
+# SECTION 8b – Experiment list sorting for variety under early truncation
+# ===========================================================================
+
+_BIN_ORDER = {"low": 0, "medium": 1, "high": 2}
+_FAMILY_ORDER = {f: i for i, f in enumerate(FAMILY_NAMES)}
+
+# ---------------------------------------------------------------------------
+# Joint (placement × entropy) bin grid for hierarchical sort
+# ---------------------------------------------------------------------------
+# We map the 3×3 grid to a single stripe index that cycles through all nine
+# cells before repeating any.  Two orderings are useful:
+#
+#   "diagonal" (default) – cycles placement and entropy simultaneously:
+#     index 0: (low-P,  low-H)    index 3: (low-P,  med-H)   …
+#     produces maximum joint diversity at every prefix length.
+#
+#   "row-major" – exhausts all entropy bins per placement bin:
+#     index 0: (low-P,  low-H)    index 1: (low-P,  med-H)   …
+#     equivalent to the old behaviour (NOT used).
+#
+# The diagonal ordering is constructed by interleaving the two axes:
+#   combined_idx = p_idx + e_idx * 3   (column-major in a 3×3 table)
+# This maps the nine cells to indices 0-8 so that incrementing by 1
+# moves across placement bins before advancing the entropy level.
+# ---------------------------------------------------------------------------
+
+def _combined_bin_index(placement_bin_label: str, entropy_bin_label: str) -> int:
+    """
+    Combined sort index for the joint (placement × entropy) grid.
+
+    Layout (combined_idx → (P-bin, H-bin)):
+      0 → (low,  low)    3 → (low,  med)    6 → (low,  high)
+      1 → (med,  low)    4 → (med,  med)    7 → (med,  high)
+      2 → (high, low)    5 → (high, med)    8 → (high, high)
+
+    Iterating 0→8 visits every placement bin at each entropy level before
+    advancing to the next entropy level, ensuring full entropy coverage
+    within the first 3 experiments, full (P × H) coverage within the
+    first 9, etc.
+    """
+    p_idx = _BIN_ORDER[placement_bin_label]
+    e_idx = _BIN_ORDER[entropy_bin_label]
+    return p_idx + e_idx * 3
+
+
+def _sort_key_flat(exp: Experiment) -> tuple:
+    """
+    Sort key for flat experiments.
+
+    Primary: entropy bin (round-robin: low → medium → high)
+    Secondary: pattern family (A → B → C → D → E)
+    Tertiary: pattern slots (for determinism)
+
+    This produces a striped layout so that running the first N experiments
+    always covers all three entropy bins roughly equally.
+    """
+    return (
+        _BIN_ORDER[exp.entropy_bin],
+        _FAMILY_ORDER.get(exp.pattern.family, 99),
+        exp.pattern.slots,
+    )
+
+
+def _sort_key_hier(he: HierarchicalExperiment) -> tuple:
+    """
+    Sort key for hierarchical experiments.
+
+    Primary: combined (placement × entropy) bin index – cycles through all
+             nine cells of the 3×3 grid so that stopping early always yields
+             full entropy variety across all placement bins.
+    Secondary: pattern family (A → B → C → D → E)
+    Tertiary:  pattern slots (for determinism)
+
+    Old behaviour (placement-bin as primary, entropy as secondary) caused
+    early truncation to exhaust low-placement experiments first, leaving
+    the full entropy range invisible in the output.  The combined index
+    fixes this by interleaving both axes simultaneously.
+    """
+    return (
+        _combined_bin_index(he.placement_bin_label, he.base.entropy_bin),
+        _FAMILY_ORDER.get(he.base.pattern.family, 99),
+        he.base.pattern.slots,
+    )
+
+
+def sort_for_variety(
+    experiments: list[Experiment],
+    hier_experiments: Optional[list["HierarchicalExperiment"]],
+) -> tuple[list[Experiment], Optional[list["HierarchicalExperiment"]]]:
+    """
+    Return sorted copies of both lists.
+
+    The sort interleaves bins so early truncation still yields varied coverage.
+    For the hierarchical list the flat list is re-sorted to match the same
+    placement-bin × entropy-bin stripe ordering for consistency in the JSON.
+    """
+    sorted_flat = sorted(experiments, key=_sort_key_flat)
+    sorted_hier = (
+        sorted(hier_experiments, key=_sort_key_hier)
+        if hier_experiments is not None
+        else None
+    )
+    return sorted_flat, sorted_hier
+
+
+# ===========================================================================
+# SECTION 9 – Utilities
+# ===========================================================================
+
+PRINTS_SEP_WIDTH = 140
+
+
+def print_baseline_set(cfg: argparse.Namespace, baseline: list[SingleRun]) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print(f"BASELINE SET  |B| = {len(baseline)}")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    by_strategy: dict[str, list[int]] = {}
+    for run in baseline:
+        by_strategy.setdefault(run.strategy.name, []).append(run.gpus)
+    for name, gpus in by_strategy.items():
+        print(f"  {name:20s}  gpus = {sorted(gpus)}")
+
+
+def print_baseline_set_topology(
+    cfg: argparse.Namespace, baseline_topo: list[BaselineWithPlacement],
+) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print(f"TOPOLOGY BASELINE SET  |B_topo| = {len(baseline_topo)}")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    for bwp in baseline_topo:
+        print(bwp)
+
+
+def print_patterns(cfg: argparse.Namespace, patterns: list[TaggedPattern]) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print(f"PATTERN SET  |P| = {len(patterns)}")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    for tp in patterns:
+        s = sum(tp.slots)
+        print(f"  [{tp.pattern_id:4s}] {str(tp.slots):<80}  totGPUs={s:<4}  util={int(s/cfg.G*100):<3}%  k={len(tp.slots)}")
+
+
+def print_experiment_set(
+    cfg: argparse.Namespace, experiments: list[Experiment],
+    title: str = "EXPERIMENT SET",
+) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print(f"{title}  |E| = {len(experiments)}")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    by_bin: dict[str, list[Experiment]] = {"low": [], "medium": [], "high": []}
+    for exp in experiments:
+        by_bin[exp.entropy_bin].append(exp)
+    for bin_name in ("low", "medium", "high"):
+        exps = by_bin[bin_name]
+        if exps:
+            print(f"\n  \033[33m── H-bin: {bin_name} ({len(exps)} experiments) ──\033[0m\n")
+            for exp in exps:
+                print(exp)
+
+
+def print_hierarchical_experiment_set(
+    cfg: argparse.Namespace, hier_experiments: list[HierarchicalExperiment],
+) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print(f"HIERARCHICAL EXPERIMENT SET  |E_hier| = {len(hier_experiments)}")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    by_pbin: dict[str, list[HierarchicalExperiment]] = {"low": [], "medium": [], "high": []}
+    for e in hier_experiments:
+        by_pbin[e.placement_bin_label].append(e)
+    for pbin in ("low", "medium", "high"):
+        if by_pbin[pbin]:
+            print(f"\n  \033[33m── P-bin: {pbin} ({len(by_pbin[pbin])} experiments) ──\033[0m\n")
+            for e in by_pbin[pbin]:
+                print(e)
+
+
+def print_placement_class_registry() -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print("PLACEMENT CLASS REGISTRY")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    print(f"  {'Name':<25}  {'Label':<28}  Score")
+    print(f"  {'-'*25}  {'-'*28}  -----")
+    for name, info in _PLACEMENT_REGISTRY.items():
+        print(f"  {name:<25}  {info.label:<28}  {info.score}")
+    print(f"\n  Per-strategy allowed classes:")
+    for strat, classes in STRATEGY_PLACEMENT_MAP.items():
+        labels = [_PLACEMENT_REGISTRY[c].label if c in _PLACEMENT_REGISTRY else c for c in classes]
+        print(f"  {strat:<20}  {', '.join(labels)}")
+
+
+def print_summary(
+    g_total: int, strategies: list[Strategy], baseline: list[SingleRun],
+    patterns: list[TaggedPattern], experiments: list[Experiment],
+    hier_experiments: Optional[list[HierarchicalExperiment]] = None,
+    baseline_topo: Optional[list[BaselineWithPlacement]] = None,
+    min_experiments: int = 0,
+    max_experiments: Optional[int] = None,
+) -> None:
+    print(f"\n\033[34m{'='*PRINTS_SEP_WIDTH}")
+    print("SUMMARY")
+    print(f"{'='*PRINTS_SEP_WIDTH}\033[0m")
+    print(f"  G (total GPUs)         : {g_total}")
+    print(f"  Strategies  |S|        : {len(strategies)}")
+    print(f"  Baseline set |B|       : {len(baseline)}")
+    if baseline_topo is not None:
+        print(f"  Topology baseline |B_t|: {len(baseline_topo)}")
+    print(f"  Pattern set |P|        : {len(patterns)}")
+    print(f"  Flat experiments |E|   : {len(experiments)}")
+    if hier_experiments is not None:
+        print(f"  Hier experiments |E_h| : {len(hier_experiments)}")
+    bounds = (
+        f"min={min_experiments}" if min_experiments else "no min"
+    ) + " / " + (
+        f"max={max_experiments}" if max_experiments is not None else "no max"
+    )
+    print(f"  Size bounds            : {bounds}")
+    print(f"  O(log G) bound         : log₂({g_total}) ≈ {math.log2(g_total):.1f}")
+
+    # Distribution breakdown
+    if hier_experiments is not None:
+        pb_counts = {b: 0 for b in PLACEMENT_BIN_NAMES}
+        hb_counts = {b: 0 for b in ENTROPY_BIN_NAMES}
+        fam_counts: dict[str, int] = {}
+        for he in hier_experiments:
+            pb_counts[he.placement_bin_label] += 1
+            hb_counts[he.base.entropy_bin] += 1
+            fam_counts[he.base.pattern.family] = fam_counts.get(he.base.pattern.family, 0) + 1
+        print(f"  Placement-bin counts   : {dict(pb_counts)}")
+        print(f"  Entropy-bin counts     : {dict(hb_counts)}")
+        print(f"  Family counts          : {dict(fam_counts)}")
+    else:
+        hb_counts = {b: 0 for b in ENTROPY_BIN_NAMES}
+        fam_counts = {}
+        for e in experiments:
+            hb_counts[e.entropy_bin] += 1
+            fam_counts[e.pattern.family] = fam_counts.get(e.pattern.family, 0) + 1
+        print(f"  Entropy-bin counts     : {dict(hb_counts)}")
+        print(f"  Family counts          : {dict(fam_counts)}")
+
+
+# ===========================================================================
+# SECTION 10 – JSON Serialization
+# ===========================================================================
+
+def _strategy_to_dict(s: Strategy) -> dict:
+    return {"name": s.name, "feasible_gpu_counts": sorted(s.feasible)}
+
+
+def _single_run_to_dict(r: SingleRun) -> dict:
+    return {"strategy": r.strategy.name, "gpus": r.gpus}
+
+
+def _config_to_dict(c: Config) -> dict:
+    return {
+        "runs": [_single_run_to_dict(r) for r in c.runs],
+        "total_gpus": c.total_gpus,
+        "utilization": round(c.utilization, 6),
+        "k": c.k,
+    }
+
+
+def _experiment_to_dict(exp: Experiment) -> dict:
+    return {
+        "pattern_id": exp.pattern.pattern_id,
+        "pattern": list(exp.pattern.slots),
+        "pattern_family": exp.pattern.family,
+        "pattern_sum": sum(exp.pattern.slots),
+        "utilization": round(sum(exp.pattern.slots) / G, 6),
+        "k": len(exp.pattern.slots),
+        "entropy_bin": exp.entropy_bin,
+        "labelling": [s.name for s in exp.labelling],
+        "config": _config_to_dict(exp.config),
+    }
+
+
+def _hier_experiment_to_dict(he: HierarchicalExperiment) -> dict:
+    d = _experiment_to_dict(he.base)
+    d["placement_class_vector"] = [
+        _PLACEMENT_REGISTRY[c].label if c in _PLACEMENT_REGISTRY else c
+        for c in he.placement_class_vector
+    ]
+    d["placement_class_vector_names"] = list(he.placement_class_vector)
+    d["placement_bin"] = he.placement_bin_label
+    d["placement_score"] = he.placement_score
+    d["placement_seed"] = he.placement_seed
+    return d
+
+
+def _baseline_topo_to_dict(bwp: BaselineWithPlacement) -> dict:
+    label = (
+        _PLACEMENT_REGISTRY[bwp.placement_class].label
+        if bwp.placement_class in _PLACEMENT_REGISTRY
+        else bwp.placement_class
+    )
+    return {
+        "run": _single_run_to_dict(bwp.run),
+        "placement_class": label,
+        "placement_class_name": bwp.placement_class,
+        "replicate_index": bwp.replicate_index,
+        "seed": bwp.seed,
+    }
+
+
+def build_json_output(
+    cfg: argparse.Namespace, strategies: list[Strategy],
+    baseline: list[SingleRun], patterns: list[TaggedPattern],
+    experiments: list[Experiment],
+    hier_experiments: Optional[list[HierarchicalExperiment]] = None,
+    baseline_topo: Optional[list[BaselineWithPlacement]] = None,
+) -> dict:
+    meta = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "G": cfg.G,
+        "seed": cfg.seed,
+        "use_topology": cfg.use_topology,
+        "topology_program": cfg.topology_program if cfg.use_topology else None,
+    }
+    parameters = {
+        "G": cfg.G,
+        "g_min": cfg.g_min,
+        "k_max": cfg.k_max,
+        "geometric_beta": cfg.beta,
+        "hierarchical_patterns": [
+            {"tier_fractions": tf, "n_tiny": nt} for tf, nt in HIERARCHICAL_PATTERNS
+        ],
+        "powerlaw_alphas": cfg.powerlaw_alphas,
+        "util_min": cfg.util_min,
+        "util_max": cfg.util_max,
+        "util_steps": cfg.util_steps,
+        "utilizations": _utilization_grid(cfg.util_min, cfg.util_max, cfg.util_steps),
+        "stochastic_tier_config": STOCHASTIC_TIER_CONFIG,
+        "n_stochastic_patterns": cfg.n_stochastic_patterns,
+        "entropy_delta_1": cfg.entropy_delta_1,
+        "entropy_delta_2": cfg.entropy_delta_2,
+        "n_samples_per_bin": cfg.n_samples_per_bin,
+        "enum_threshold": cfg.enum_threshold,
+        "min_experiments": cfg.min_experiments,
+        "max_experiments": cfg.max_experiments,
+        "topo_q1": cfg.topo_q1,
+        "topo_q2": cfg.topo_q2,
+        "topo_q3": cfg.topo_q3,
+        "n_baseline_topo_reps": cfg.n_baseline_topo_reps if cfg.use_topology else None,
+        "n_placement_seeds_per_vector": cfg.n_placement_seeds_per_vector if cfg.use_topology else None,
+        "placement_bin_lo_hi": cfg.placement_bin_lo_hi,
+        "placement_bin_med_hi": cfg.placement_bin_med_hi,
+        "n_placement_samples_per_bin": cfg.n_placement_samples_per_bin,
+        "placement_class_defs": [
+            {"name": name, "label": label, "score": score}
+            for name, label, score in PLACEMENT_CLASS_DEFS
+        ],
+        "strategy_placement_map": STRATEGY_PLACEMENT_MAP,
+    }
+    doc = {
+        "meta": meta,
+        "parameters": parameters,
+        "strategies": [_strategy_to_dict(s) for s in strategies],
+        "baseline_set": [_single_run_to_dict(r) for r in baseline],
+        "pattern_set": [
+            {"pattern_id": tp.pattern_id,
+             "slots": list(tp.slots), "k": len(tp.slots),
+             "total_gpus": sum(tp.slots),
+             "utilization": round(sum(tp.slots) / cfg.G, 6),
+             "family": tp.family}
+            for tp in patterns
+        ],
+        "experiments": [_experiment_to_dict(e) for e in experiments],
+        "summary": {
+            "n_strategies": len(strategies),
+            "n_baseline_runs": len(baseline),
+            "n_patterns": len(patterns),
+            "n_flat_experiments": len(experiments),
+            "log2_G": round(math.log2(cfg.G), 3),
+        },
+    }
+    if baseline_topo is not None:
+        doc["baseline_set_topology"] = [_baseline_topo_to_dict(b) for b in baseline_topo]
+        doc["summary"]["n_baseline_topo_runs"] = len(baseline_topo)
+    if hier_experiments is not None:
+        doc["hierarchical_experiments"] = [_hier_experiment_to_dict(e) for e in hier_experiments]
+        doc["summary"]["n_hier_experiments"] = len(hier_experiments)
+    return doc
+
+
+def serialize_to_json(doc: dict, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False)
+    n = len(doc.get("hierarchical_experiments", doc.get("experiments", [])))
+    print(f"\n\033[32m[JSON] Serialized → {path}  ({n} experiments)\033[0m")
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+def override_args_values(args: argparse.Namespace) -> None:
+    global G, G_MIN, K_MAX, STRATEGY_DEFS, STOCHASTIC_TIER_CONFIG, STRATEGY_PLACEMENT_MAP
+
+    if args.baseline_extended:
+        STRATEGY_DEFS = STRATEGY_DEFS_EXTENDED
+        STRATEGY_PLACEMENT_MAP = STRATEGY_PLACEMENT_MAP_EXTENDED
+        if args.topo_q1 == 8:
+            STRATEGY_DEFS = STRATEGY_DEFS_EXTENDED_8GPUS_NODE
+
+    if args.dgx == "DGX_A100":
+        args.g = 8
+        args.g_min = 2
+        args.k_max = math.floor(args.g / args.g_min)
+        STRATEGY_DEFS = STRATEGY_DEFS_DGX_A100
+        STOCHASTIC_TIER_CONFIG = {
+            "small": {
+                "tier_weight": 0.7,
+                "sizes": [2, 4],
+                "sub_weights": {},
+            },
+            "large": {
+                "tier_weight": 0.3,
+                "sizes": [6],
+                "sub_weights": {},
+            },
+        }
+        return
+    
+    args.g_min = max(args.g_min, 2*args.topo_q1)
+    if not args.baseline_extended:
+        NEW_STRATEGY_DEFS = []
+        for pair in STRATEGY_DEFS: 
+            NEW_STRATEGY_DEFS.append((pair[0], [g/4 * args.topo_q1 for g in pair[1]]))
+        STRATEGY_DEFS = NEW_STRATEGY_DEFS
+
+def main(cfg: argparse.Namespace) -> None:
+    global _PLACEMENT_REGISTRY
+    _PLACEMENT_REGISTRY = _build_placement_registry(PLACEMENT_CLASS_DEFS)
+    
+    global TOPO_Q1
+    TOPO_Q1 = cfg.topo_q1
+
+    rng = random.Random(cfg.seed)
+
+    if cfg.use_topology:
+        print_placement_class_registry()
+
+    strategies = build_strategies(STRATEGY_DEFS)
+    baseline = build_baseline_set(strategies, cfg.G, strict=False)
+    print_baseline_set(cfg, baseline)
+
+    feasible_gpu_counts = compute_feasible_gpu_counts(strategies, cfg.G)
+    utilizations = _utilization_grid(cfg.util_min, cfg.util_max, cfg.util_steps)
+
+    gen_flags = {
+        "A": not cfg.use_topology or cfg.include_uniform_patterns,
+        "B": False,
+        "C": False,
+        "D": False,
+        "E": cfg.n_stochastic_patterns > 0,
+    }
+
+    patterns = build_pattern_set(
+        g_total=cfg.G, k_max=cfg.k_max, g_min=cfg.g_min, beta=cfg.beta,
+        hierarchical_defs=HIERARCHICAL_PATTERNS, powerlaw_alphas=cfg.powerlaw_alphas,
+        utilizations=utilizations, util_min=cfg.util_min, util_max=cfg.util_max,
+        stochastic_tier_config=STOCHASTIC_TIER_CONFIG,
+        n_stochastic_patterns=cfg.n_stochastic_patterns,
+        feasible_gpu_counts=feasible_gpu_counts, rng=rng,
+        generate_equal_splits=gen_flags["A"],
+        generate_geometric=gen_flags["B"],
+        generate_hierarchical=gen_flags["C"],
+        generate_powerlaw=gen_flags["D"],
+        generate_stochastic=gen_flags["E"],
+    )
+    print_patterns(cfg, patterns)
+
+    # ── Shared budget counter ────────────────────────────────────────────────
+    # When topology is enabled the budget gates hier_experiments (the primary
+    # output).  The flat experiment set is built without a budget so it is
+    # fully enumerated; the budget is then consumed by the hierarchical layer.
+    # When topology is disabled the budget gates flat experiments directly.
+    flat_budget: ExperimentBudget
+    hier_budget: Optional[ExperimentBudget]
+
+    if cfg.use_topology:
+        # Build all flat experiments (uncapped); budget is spent on the hier layer.
+        flat_budget = ExperimentBudget(None)
+        hier_budget = ExperimentBudget(cfg.max_experiments)
+    else:
+        flat_budget = ExperimentBudget(cfg.max_experiments)
+        hier_budget = None
+
+    experiments = build_experiment_set(
+        cfg=cfg, patterns=patterns, strategies=strategies,
+        n_per_bin=cfg.n_samples_per_bin,
+        delta1_frac=cfg.entropy_delta_1, delta2_frac=cfg.entropy_delta_2,
+        enum_threshold=cfg.enum_threshold, rng=rng,
+        budget=flat_budget,
+    )
+    print_experiment_set(cfg, experiments)
+
+    hier_experiments: Optional[list[HierarchicalExperiment]] = None
+    baseline_topo: Optional[list[BaselineWithPlacement]] = None
+
+    if cfg.use_topology:
+        oracle = TopologyOracle(
+            program=cfg.topology_program,
+            q1=cfg.topo_q1, q2=cfg.topo_q2, q3=cfg.topo_q3,
+        )
+        if not oracle._available:
+            print(
+                f"\n[TopologyOracle] External program not found – using stub responses.\n"
+                f"  Program: '{cfg.topology_program}'"
+            )
+
+        baseline_topo = build_baseline_set_with_topology(
+            strategies=strategies, g_total=cfg.G, oracle=oracle,
+            n_baseline_topo_reps=cfg.n_baseline_topo_reps,
+        )
+        print_baseline_set_topology(cfg, baseline_topo)
+
+        hier_experiments = build_hierarchical_experiment_set(
+            flat_experiments=experiments, oracle=oracle,
+            n_placement_samples_per_bin=cfg.n_placement_samples_per_bin,
+            placement_bin_lo_hi=cfg.placement_bin_lo_hi,
+            placement_bin_med_hi=cfg.placement_bin_med_hi,
+            g_total=cfg.G, rng=rng,
+            n_seeds_per_vector=cfg.n_placement_seeds_per_vector,
+            budget=hier_budget,
+        )
+        print_hierarchical_experiment_set(cfg, hier_experiments)
+
+    # ── Sort for variety under early truncation ──────────────────────────────
+    experiments, hier_experiments = sort_for_variety(experiments, hier_experiments)
+
+    # ── Validate lower bound ─────────────────────────────────────────────────
+    primary = hier_experiments if hier_experiments is not None else experiments
+    primary_name = "hierarchical" if hier_experiments is not None else "flat"
+    if cfg.min_experiments > 0 and len(primary) < cfg.min_experiments:
+        raise ValueError(
+            f"Generated {primary_name} experiment set has {len(primary)} entries, "
+            f"below --min-experiments={cfg.min_experiments}.  "
+            "Raise --n-samples-per-bin / --n-stochastic-patterns, or lower the bound."
+        )
+
+    print_summary(cfg.G, strategies, baseline, patterns, experiments,
+                  hier_experiments, baseline_topo,
+                  cfg.min_experiments, cfg.max_experiments)
+
+    doc = build_json_output(
+        cfg=cfg, strategies=strategies, baseline=baseline,
+        patterns=patterns, experiments=experiments,
+        hier_experiments=hier_experiments, baseline_topo=baseline_topo,
+    )
+    serialize_to_json(doc, cfg.output_json)
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return n
+
+
+def _unit_float(value: str) -> float:
+    f = float(value)
+    if not (0.0 < f < 1.0):
+        raise argparse.ArgumentTypeError(f"must be in (0, 1), got {value}")
+    return f
+
+
+def _fraction_float(value: str) -> float:
+    f = float(value)
+    if not (0.0 <= f <= 1.0):
+        raise argparse.ArgumentTypeError(f"must be in [0, 1], got {value}")
+    return f
+
+
+def _utilization_grid(util_min: float, util_max: float, steps: int) -> list[float]:
+    if steps < 1:
+        raise ValueError(f"--util-steps must be >= 1, got {steps}")
+    if not (0.0 < util_min <= util_max <= 1.0):
+        raise ValueError(f"Need 0 < util_min <= util_max <= 1, got [{util_min}, {util_max}]")
+    if steps == 1:
+        return [util_max]
+    return [util_min + (util_max - util_min) * i / (steps - 1) for i in range(steps)]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="experiment_design.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Multi-Training Congestion – Experiment Design Generator
+=======================================================
+Generates structured experiment sets for studying interference between
+concurrent distributed training jobs.
+""",
+        epilog="""
+examples:
+  python experiment_design.py --G 8
+  python experiment_design.py --G 72 --no-topology --seed 0
+  python experiment_design.py --G 72 --use-topology --n-baseline-topo-reps 3
+  python experiment_design.py --G 72 --min-experiments 20 --max-experiments 60
+  python experiment_design.py --G 72 --output-json my_experiments.json
+""",
+    )
+
+    parser.add_argument("--G", "-G", required=True, type=_positive_int, metavar="N",
+                        help="Total number of GPUs. REQUIRED.")
+    parser.add_argument("--dgx", required=False, help="Use DGX-A100 node.",
+                        choices=["DGX_A100"], default=None)
+    parser.add_argument("--baseline-extended", action="store_true",
+                        help="Enable extended baseline (all feasible runs, not just powers of two).")
+
+    pg = parser.add_argument_group("pattern generation")
+    pg.add_argument("--k-max", type=_positive_int, default=K_MAX, metavar="K",
+                    help=f"Max concurrent jobs (default: {K_MAX}).")
+    pg.add_argument("--g-min", type=_positive_int, default=G_MIN, metavar="G",
+                    help=f"Min GPU slot size (default: {G_MIN}).")
+    pg.add_argument("--beta", type=_unit_float, default=GEOMETRIC_BETA, metavar="β",
+                    help=f"Geometric decay factor (default: {GEOMETRIC_BETA}).")
+    pg.add_argument("--powerlaw-alphas", type=float, nargs="+", default=POWERLAW_ALPHAS,
+                    metavar="α", help=f"Power-law tail exponents (default: {POWERLAW_ALPHAS}).")
+    pg.add_argument("--util-min", type=_fraction_float, default=UTIL_MIN, metavar="ρ",
+                    help=f"Min utilization (default: {UTIL_MIN}).")
+    pg.add_argument("--util-max", type=_fraction_float, default=UTIL_MAX, metavar="ρ",
+                    help=f"Max utilization (default: {UTIL_MAX}).")
+    pg.add_argument("--util-steps", type=_positive_int, default=UTIL_STEPS, metavar="N",
+                    help=f"Utilization grid steps (default: {UTIL_STEPS}).")
+    pg.add_argument("--n-stochastic-patterns", type=int,
+                    default=N_STOCHASTIC_PATTERNS, metavar="N",
+                    help=f"Family-E patterns to generate (default: {N_STOCHASTIC_PATTERNS}).")
+
+    eg = parser.add_argument_group("entropy-stratified sampling")
+    eg.add_argument("--n-samples-per-bin", type=_positive_int, default=N_SAMPLES_PER_BIN,
+                    metavar="N", help=f"Labellings per entropy bin (default: {N_SAMPLES_PER_BIN}).")
+    eg.add_argument("--entropy-delta-1", type=_fraction_float, default=ENTROPY_DELTA_1,
+                    metavar="δ1", help=f"Low/medium entropy boundary (default: {ENTROPY_DELTA_1}).")
+    eg.add_argument("--entropy-delta-2", type=_fraction_float, default=ENTROPY_DELTA_2,
+                    metavar="δ2", help=f"Medium/high entropy boundary (default: {ENTROPY_DELTA_2}).")
+    eg.add_argument("--enum-threshold", type=int, default=ENUM_THRESHOLD, metavar="N",
+                    help=f"Max |Φ(P)| for exact enumeration (default: {ENUM_THRESHOLD:,}).")
+
+    sg = parser.add_argument_group("experiment list size bounds")
+    sg.add_argument("--min-experiments", type=int, default=MIN_EXPERIMENTS, metavar="N",
+                    help=(
+                        f"Minimum required experiments (default: {MIN_EXPERIMENTS}, 0=disabled). "
+                        "Raises an error if the generated set is smaller."
+                    ))
+    sg.add_argument("--max-experiments", type=int, default=MAX_EXPERIMENTS, metavar="N",
+                    help=(
+                        "Hard upper bound on output experiments (default: unlimited). "
+                        "Sampling stops as soon as this count is reached; "
+                        "round-robin bin ordering ensures the cap yields a balanced slice."
+                    ))
+
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED, metavar="S",
+                        help=f"Random seed (default: {RANDOM_SEED}).")
+
+    tg = parser.add_argument_group("topology / placement")
+    tex = tg.add_mutually_exclusive_group()
+    tex.add_argument("--use-topology", dest="use_topology", action="store_true",
+                     default=USE_TOPOLOGY, help="Enable hierarchical placement analysis.")
+    tex.add_argument("--no-topology", dest="use_topology", action="store_false",
+                     help="Skip placement analysis (flat model only).")
+    tg.add_argument("--include-uniform-patterns", action="store_true",
+                     default=False, help="Enable uniform patterns.")
+    tg.add_argument("--topology-program", default=TOPOLOGY_PROGRAM, metavar="PATH",
+                    help=f"Path to topology oracle (default: '{TOPOLOGY_PROGRAM}'). "
+                         "Required commands: find_placement, shuffle_within_class.")
+    tg.add_argument("--topo-q1", type=_positive_int, default=TOPO_Q1, metavar="N",
+                    help=f"GPUs per intra-node NVLink domain (default: {TOPO_Q1}).")
+    tg.add_argument("--topo-q2", type=_positive_int, default=TOPO_Q2, metavar="N",
+                    help=f"GPUs per L1-switch/rack domain (default: {TOPO_Q2}).")
+    tg.add_argument("--topo-q3", type=_positive_int, default=TOPO_Q3, metavar="N",
+                    help=f"GPUs per group (default: {TOPO_Q3}).")
+    tg.add_argument("--n-baseline-topo-reps", type=_positive_int,
+                    default=N_BASELINE_TOPO_REPS, metavar="N",
+                    help=(
+                        f"Replicates per baseline for cross-group classes "
+                        f"(default: {N_BASELINE_TOPO_REPS}). "
+                    ))
+    tg.add_argument("--n-placement-seeds-per-vector", type=_positive_int,
+                    default=N_PLACEMENT_SEEDS_PER_VECTOR, metavar="N",
+                    help=(
+                        f"Independent nodelist seeds per (experiment, placement vector) pair "
+                        f"(default: {N_PLACEMENT_SEEDS_PER_VECTOR})."
+                    ))
+    tg.add_argument("--n-placement-samples-per-bin", type=_positive_int,
+                    default=N_PLACEMENT_SAMPLES_PER_BIN, metavar="N",
+                    help=f"Placement vectors per locality bin per experiment (default: {N_PLACEMENT_SAMPLES_PER_BIN}).")
+    tg.add_argument("--placement-bin-lo-hi", type=float, default=PLACEMENT_BIN_LO_HI,
+                    metavar="F", help=f"Low/medium placement score boundary (default: {PLACEMENT_BIN_LO_HI}).")
+    tg.add_argument("--placement-bin-med-hi", type=float, default=PLACEMENT_BIN_MED_HI,
+                    metavar="F", help=f"Medium/high placement score boundary (default: {PLACEMENT_BIN_MED_HI}).")
+
+    parser.add_argument("--output-json", default=DEFAULT_JSON_OUTPUT, metavar="PATH",
+                        help=f"Output JSON path (default: '{DEFAULT_JSON_OUTPUT}').")
+
+    return parser
+
+
+def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.entropy_delta_1 >= args.entropy_delta_2:
+        parser.error("--entropy-delta-1 must be < --entropy-delta-2.")
+    if args.g_min > args.G:
+        parser.error(f"--g-min ({args.g_min}) cannot exceed --G ({args.G}).")
+    if args.enum_threshold < 0:
+        parser.error("--enum-threshold must be >= 0.")
+    for a in args.powerlaw_alphas:
+        if a <= 1.0:
+            parser.error(f"--powerlaw-alphas: each α must be > 1, got {a}.")
+    if args.util_min > args.util_max:
+        parser.error("--util-min must be <= --util-max.")
+    if args.util_min <= 0.0:
+        parser.error("--util-min must be > 0.")
+    if args.placement_bin_lo_hi >= args.placement_bin_med_hi:
+        parser.error("--placement-bin-lo-hi must be < --placement-bin-med-hi.")
+    if args.min_experiments < 0:
+        parser.error("--min-experiments must be >= 0.")
+    if args.max_experiments is not None:
+        if args.max_experiments < 1:
+            parser.error("--max-experiments must be >= 1.")
+        if args.min_experiments > args.max_experiments:
+            parser.error("--min-experiments must be <= --max-experiments.")
+
+    for strat_name, _ in STRATEGY_DEFS:
+        if strat_name not in STRATEGY_PLACEMENT_MAP:
+            print(
+                f"[WARNING] Strategy '{strat_name}' has no entry in STRATEGY_PLACEMENT_MAP; "
+                "it will receive no placement classes and be skipped in hierarchical experiments."
+            )
+    for strat_name, pc_names in STRATEGY_PLACEMENT_MAP.items():
+        for pc_name in pc_names:
+            if pc_name not in _PLACEMENT_REGISTRY:
+                print(
+                    f"[WARNING] STRATEGY_PLACEMENT_MAP['{strat_name}'] references unknown "
+                    f"placement class '{pc_name}' (not in PLACEMENT_CLASS_DEFS)."
+                )
+
+
+if __name__ == "__main__":
+    _parser = build_parser()
+    _args = _parser.parse_args()
+    _validate_args(_args, _parser)
+    override_args_values(_args)
+    print(f"STRATEGY_PLACEMENT_MAP: {STRATEGY_PLACEMENT_MAP}")
+    main(_args)
