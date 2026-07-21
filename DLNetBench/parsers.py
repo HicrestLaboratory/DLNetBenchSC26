@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 sys.path.append(str(Path(__file__).parent.parent / "common" / "ccutils" / "parser"))
-from ccutils_parser import MPIOutputParser
+from ccutils_parser import MPIOutputParser, SectionFormatError
 
 
 def stdout_file_to_csv_multi(stdout_path: Path, return_dataframes: bool = False):

@@ -151,17 +151,3 @@ def compact_all(stdout: str, warn_within_rank: bool = False) -> str:
     # print()
     
     return "\n###\n".join(blocks)
-
-
-if __name__ == "__main__":
-    import sys
-    import time
-
-    filename = sys.argv[1]
-    with open(filename, "r") as f:
-        stdout = f.read()
-    start_time = time.time()
-    compacted = compact_all(stdout)
-    end_time = time.time()
-    print(f"Compaction took {end_time - start_time:.2f} seconds")
-    print(compacted)

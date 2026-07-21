@@ -4,3 +4,8 @@ __pycache__/
 **/SbatchMan/
 **/workerpool_out/
 **/ae/
+
+**/*.dot
+**/*.svg
+**/*.png
+**/*.pdf

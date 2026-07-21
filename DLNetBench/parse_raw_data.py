@@ -51,7 +51,7 @@ SYSTEMS = ["jupiter", "leonardo", "nvl72", "alps", "dgxA100", "lumi"] # , "intel
 SBM_SYSTEM_NAME_MAP = {"dgxA100": "baldo", "intel": "enea"}
 
 SBM_SYSTEM_ARCHIVES = {
-    'alps': ['dppp_ccs', 'duplicates', 'preliminary_tests'],
+    'alps': [], # 'dppp_ccs', 'duplicates', 'preliminary_tests'
     'jupiter': ['DP_baselines_run1', 'DP_baselines_run2', 'baseline_correct_compute', 'baselines_prod'],
 }
 
@@ -95,16 +95,21 @@ def get_system_jobs(system: str) -> List[sbm.Job]:
     
     
 def parse_proxy_stdout_data(stdout: Union[str, Path], gpus: int) -> Union[None, RunMeasurements]:
-    df_dict, _ = (
-        stdout_to_csv_multi(stdout, return_dataframes=True)
-        if isinstance(stdout, str)
-        else stdout_file_to_csv_multi(stdout, return_dataframes=True)
-    )
-    return RunMeasurements.from_df_dict(df_dict, n_ranks=gpus) if 'main' in df_dict else None
+    try:
+        df_dict, _ = (
+            stdout_to_csv_multi(stdout, return_dataframes=True)
+            if isinstance(stdout, str)
+            else stdout_file_to_csv_multi(stdout, return_dataframes=True)
+        )
+        return RunMeasurements.from_df_dict(df_dict, n_ranks=gpus) if 'main' in df_dict else None
+    except Exception as e:
+        print(f'COULD NOT PARSE JOB: {e}')
+    
+    return None
     
                     
 
-def parse_baselines(systems=SYSTEMS) -> Dict[str, List[Baseline]]:
+def parse_baselines(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str, List[Baseline]]:
     """
     Parse all isolated baseline experiments from SbatchMan output.
 
@@ -117,11 +122,12 @@ def parse_baselines(systems=SYSTEMS) -> Dict[str, List[Baseline]]:
     
     print(f'Loading baselines for systems: {systems}')
     for system in systems:
-        svg_out_base = Path('plots/placements/baselines') / system
-        if svg_out_base.exists():
-            shutil.rmtree(svg_out_base)
-            print(f'removing: {svg_out_base}')
-        svg_out_base.mkdir(parents=True, exist_ok=True)
+        if generate_placement_svgs:
+            svg_out_base = Path('plots/placements/baselines') / system
+            if svg_out_base.exists():
+                shutil.rmtree(svg_out_base)
+                print(f'removing: {svg_out_base}')
+            svg_out_base.mkdir(parents=True, exist_ok=True)
             
         print(f'  Loading system: {system}')
         jobs = get_system_jobs(system)
@@ -190,15 +196,17 @@ def parse_baselines(systems=SYSTEMS) -> Dict[str, List[Baseline]]:
                         nodes = expand_slurm_nodelist(nodes)
                         allocations['baseline'] = nodes
                 # print(allocations)
-                if not allocations:
-                    print('\n'.join(stdout.splitlines()[:40]))
+                # if not allocations:
+                #     print('\n'.join(stdout.splitlines()[:40]))
                 if allocations:
-                    svg_out = svg_out_base / f'{strategy}_{model}_g{gpus}_{placement_class}'
-                    out_idx = 0
-                    svg_out = svg_out.with_stem(svg_out.stem + f'_{out_idx}').with_suffix('.svg')
-                    while svg_out.exists():
-                        out_idx += 1
+                    svg_out = None
+                    if generate_placement_svgs:
+                        svg_out = svg_out_base / f'{strategy}_{model}_g{gpus}_{placement_class}'
+                        out_idx = 0
                         svg_out = svg_out.with_stem(svg_out.stem + f'_{out_idx}').with_suffix('.svg')
+                        while svg_out.exists():
+                            out_idx += 1
+                            svg_out = svg_out.with_stem(svg_out.stem + f'_{out_idx}').with_suffix('.svg')
                     try:
                         allocation_stats = placer.get_allocation_stats(allocations, out_svg=svg_out)
                     except Exception as e:
@@ -381,7 +389,7 @@ def get_job_placer(system: str) -> Union[JobPlacer, None]:
         
     return PLACERS_CACHE[system]
 
-def parse_concurrent(systems=SYSTEMS) -> Dict[str, List[ConcurrentRun]]:
+def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str, List[ConcurrentRun]]:
     """
     Parse all concurrent-execution stdout files from the workerpool output.
     """
@@ -404,9 +412,6 @@ def parse_concurrent(systems=SYSTEMS) -> Dict[str, List[ConcurrentRun]]:
         for j_i, job in enumerate(jobs):
             if j_i % 10 == 0:
                 print(f'  job {j_i:<3} of {len(jobs)}')
-            
-            # if str(job.job_id) == str(38409415):
-            #     print('LUI!!!')
             
             if job.tag.startswith('baseline'):
                 continue
@@ -448,12 +453,13 @@ def parse_concurrent(systems=SYSTEMS) -> Dict[str, List[ConcurrentRun]]:
                                 name = name.split('/')[1]
                                 nodes = eval(nodes)
                                 allocations[name] = nodes
-                                
+                               
                         out = None
-                        # out = Path('plots/placements')
-                        # out.mkdir(parents=True, exist_ok=True)
-                        # out /= job.tag
-                        # out = out.with_suffix('.svg')
+                        if generate_placement_svgs: 
+                            out = Path('plots/placements/concurrent')
+                            out.mkdir(parents=True, exist_ok=True)
+                            out /= job.tag
+                            out = out.with_suffix('.svg')
                         try:
                             allocation_stats = placer.get_allocation_stats(allocations, out_svg=out)
                         except Exception as e:
@@ -562,7 +568,6 @@ def parse_concurrent(systems=SYSTEMS) -> Dict[str, List[ConcurrentRun]]:
                     stdout_lines = stdout.splitlines()
                     stdout_path = Path(stdout_lines[0].strip().removeprefix('stdout: '))
                     try:
-                        # FIXME shall we exclude the first run here as well?
                         measurements = parse_proxy_stdout_data(stdout_path, int(gpus))
                         multi_runs[RunKey(
                             system=system,

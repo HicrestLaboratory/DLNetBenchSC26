@@ -34,7 +34,8 @@ This step generates both baselines and concurrent experiments.
 ```bash
 # For instance, on a systems with 4 GPUs per node
 AVAIL_NODES=32
-python3 experiments_generator.py -G $((4 * $AVAIL_NODES)) --util-min 0.9 --util-max 1.0 --max-experiments 6 --output-json ae.json
+python3 experiments_generator.py -G $((4 * $AVAIL_NODES)) --util-min 0.9 --util-max 1.0 --max-experiments 10 --output-json ae.json
+python3 experiments_generator.py -G $((4 * $AVAIL_NODES)) --util-min 0.9 --util-max 1.0 --max-experiments 10 --use-topology --output-json ae_with_placement.json
 ```
 
 For all arguments descriptions run:
@@ -50,6 +51,7 @@ This step applies splits the concurrent experiments described in the JSON, creat
 ```bash
 # For instance, expand the previously generated experiments JSON for the Leonardo supercomputer
 python3 expand_experiments.py ae.json --system leonardo --gpu-model A100 --gpus-per-node 4 --comm-lib nccl --placement-mode linear --output-dir ae
+python3 expand_experiments.py ae_with_placement.json --system leonardo --gpu-model A100 --gpus-per-node 4 --comm-lib nccl --placement-mode runtime --output-dir ae_with_placement
 ```
 
 For all arguments descriptions run:
@@ -67,8 +69,11 @@ sbatchman configure -f configs.yaml
 
 # Baselines
 python3 run_baselines_no_placement.py --comm-lib nccl --gpu-model A100 --gpus-per-node 4 --cpus-per-task 8 --system leonardo ae.json
+python3 run_baselines_placements.py --comm-lib nccl --gpu-model A100 --gpus-per-node 4 --cpus-per-task 8 --system leonardo ae_with_placement.json
 
 # Concurrent (32 nodes)
+# Change the experiments directory `experiment: "ae/"` as needed
+# In the case of concurrent runs with placement, the related information are directly stored in the JSON descriptors 
 sbatchman launch -f concurrent.yaml
 ```
 
