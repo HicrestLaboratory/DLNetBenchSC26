@@ -74,7 +74,7 @@ def main(args: argparse.Namespace, config_prefix:str) -> None:
             print(f'Skipping job {strategy} @ {nodes} nodes. Limit is {args.max_n_nodes}.')
             continue
 
-        commands = get_command(strategy, num_gpus, args.comm_lib, args.gpu_model, num_warmup_override=0, use_dgx=(args.dgx == "DGX_A100"))
+        commands = get_command(strategy, num_gpus, args.comm_lib, args.gpu_model, num_warmup_override=0, use_dgx=(args.dgx == "DGX_A100"), use_8gpus=(args.gpus_per_node == 8))
 
         for comm_i, comm in enumerate(commands):
             if args.use_mpirun:
@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dgx", required=False, help="Use DGX-A100 node.", choices=["DGX_A100"], default=None)
 
     p.add_argument(
-        "--system", required=True, metavar="SYSTEM", choices=['leonardo', 'jupiter', 'alps_clariden', 'nvl72', 'baldo'],
+        "--system", required=True, metavar="SYSTEM", choices=['leonardo', 'jupiter', 'alps_clariden', 'nvl72', 'baldo', 'lumi'],
         help="The name of the system",
     )
     p.add_argument(
@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--gpu-model", type=str, required=True, metavar="GPU_MODEL", 
-        help="The GPU model to emulate compute time (sleep)", choices=["GB300", "GB200", "B200", "H100", "H200", "A100", "GH200"]
+        help="The GPU model to emulate compute time (sleep)", choices=["GB300", "GB200", "B200", "H100", "H200", "A100", "GH200", "MI250X"]
     )
     p.add_argument(
         "--gpus-per-node", type=int, required=True, metavar="N",

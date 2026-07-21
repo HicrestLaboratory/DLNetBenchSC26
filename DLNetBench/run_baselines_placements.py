@@ -253,6 +253,7 @@ def main(args: argparse.Namespace) -> None:
             strategy, num_gpus, args.comm_lib,
             gpu_model=args.gpu_model,
             num_warmup_override=0,
+            use_8gpus=(args.gpus_per_node == 8),
         )
         for comm in commands:
             command = f"srun -N{nodes} -n{num_gpus} --ntasks-per-node={args.gpus_per_node} --cpus-per-task={args.cpus_per_task} {' '.join(EXTRA_SRUN_FLAGS.get(args.system, []))} {comm}"
