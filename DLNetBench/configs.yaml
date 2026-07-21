@@ -1,0 +1,181 @@
+variables:
+  nodes: [2, 4, 6, 8, 10, 12, 14, 16, 18, 32, 56, 64, 128, 256, 330, 333, 512, 655, 1024]
+  gpus: [2, 4, 8]
+
+isarco:
+  scheduler: local
+
+  default_conf:
+    time: "00:03:00"
+    modules: 
+      - "nvhpc-hpcx-cuda13/26.1"
+
+  configs:
+    - name: "gpus_{gpus}"
+
+nvl72:
+  scheduler: slurm
+
+  default_conf:
+    # Change me as needed
+    partition: "gamoraq"
+    time: "00:03:00"
+    # gpus: 4
+    # qos: "?"
+    cpus_per_task: 8
+    exclusive: true
+    custom_headers:
+      - "#SBATCH --ntasks-per-node=4"
+
+    # SPECIFY IF NEEDED
+    # modules: 
+    #   - ""
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"
+      
+    - name: "{nodes}_nodes_no_mnnvl"
+      nodes: "{nodes}"
+      env:
+        - "NCCL_MNNVL_ENABLE=0"
+
+baldo:
+  scheduler: slurm
+
+  default_conf:
+    time: "00:15:00"
+    account: "flavio.vella"
+    partition: "short"
+    qos: "normal"
+    nodes: 1
+    ntasks: 8
+    nodelist: ["gpu01"]
+    reservation: "gpu_vella"
+    modules: 
+      - "hpcx-ompi"
+      - "NVHPC/nvhpc-hpcx-cuda12/24.7"
+    custom_headers:
+      - "#SBATCH --cpus-per-task=4"
+
+  configs:
+    - name: "{gpus}_gpus"
+      gpus: "{gpus}"
+
+      
+leonardo:
+  scheduler: slurm
+
+  default_conf:
+    account: "IscrC_OMG-25"
+    cpus_per_task: 8
+    gpus: 4
+    time: "00:05:00"
+    partition: "boost_usr_prod"
+    # boost_qos_bprod
+    qos: "boost_qos_bprod" #"normal" 
+    exclusive: true
+    custom_headers:
+      - "#SBATCH --ntasks-per-node=4"
+    modules: 
+      - "gcc/12.2.0"
+      - "openmpi/4.1.6--gcc--12.2.0-cuda-12.2"
+      - "nvhpc/24.5"
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"
+      env:
+        - "NCCL_IB_SL=1"
+        - "UCX_IB_SL=1"
+
+lumi:
+  scheduler: slurm
+
+  default_conf:
+    account: "project_465002469"
+    cpus_per_task: 7
+    time: "00:10:00"
+    partition: "standard-g"
+    gpus: 8
+    env:
+      - "NCCL_NET_GDR_LEVEL=3"
+      - "FI_CXI_ATS=0"
+      - "NCCL_BUFFSIZE=33554432"
+      - "NCCL_IGNORE_CPU_AFFINITY=1"
+      - "FI_CXI_DEFAULT_CQ_SIZE=13107"
+      - "HSA_ENABLE_SDMA=0"
+      - "NCCL_SOCKET_IFNAME=hsn0"
+    custom_headers:
+        - "#SBATCH --ntasks-per-node=8"
+        - "#SBATCH --exclusive"
+        - "#SBATCH --contiguous"
+    modules:
+      - "LUMI/25.03 partition/G"
+      - "craype-accel-amd-gfx90a"
+      - "aws-ofi-rccl"
+      - "rocm/6.3.4"
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"
+
+alps_clariden:
+  scheduler: slurm
+
+  default_conf:
+    account: "g220"
+    reservation: "PA-2851"
+    cpus_per_task: 72
+    time: "00:04:00"
+    partition: "normal"
+    exclude:
+      - "nid006120"
+    gpus: 4
+    exclusive: true
+    custom_headers:
+      - "#SBATCH --uenv=prgenv-gnu/26.3:v1"
+      - "#SBATCH --view=default"
+      - "#SBATCH --ntasks-per-node=4"
+    # modules:
+    #   - "gcc/14.3.0"
+    #   - "cuda/12.9.1"
+    #   - "nccl/2.28.9-1"
+    #   - "openmpi/5.0.9"
+    #   - "libfabric/2.3.1"
+    #   - "aws-ofi-nccl/1.17.1"
+    # env:
+    #   - "NCCL_NCHANNELS_PER_NET_PEER=4"
+    #   - "NCCL_NET=\"AWS Libfabric\""
+    #   - "NCCL_NET_GDR_LEVEL=PHB"
+    #   - "NCCL_CROSS_NIC=1"
+    #   - "NCCL_PROTO=^LL128"
+    #   - "PMIX_MCA_psec=^munge"
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"
+
+
+jupiter:
+  scheduler: slurm
+
+  default_conf:
+    account: "exalab"
+    cpus_per_task: 72
+    gpus: 4
+    exclusive: true
+    time: "00:05:00"
+    partition: "booster"
+    # exclude: "jpbo-046-45,jpbo-097-17,jpbo-019-11,jpbo-016-06,jpbo-047-17,jpbo-096-33,jpbo-016-22,jpbo-096-44,jpbo-018-20,jpbo-048-26,jpbo-099-26,jpbo-019-21,jpbo-016-34,jpbo-017-24,jpbo-018-37,jpbo-046-18,jpbo-046-06,jpbo-017-18,jpbo-050-14,jpbo-018-18,jpbo-019-12,jpbo-100-18,jpbo-017-06,jpbo-046-02,jpbo-016-41,jpbo-019-40,jpbo-048-24,jpbo-016-14,jpbo-099-24,jpbo-017-33,jpbo-050-43,jpbo-018-27,jpbo-100-19,jpbo-096-08,jpbo-047-15,jpbo-047-34,jpbo-050-04,jpbo-100-02,jpbo-050-45,jpbo-017-10"
+    modules:
+      - "CUDA/13"
+      - "nvidia-compilers/25.9-CUDA-13"
+      - "NCCL/default-CUDA-13"
+      - "OpenMPI/5.0.8"
+    custom_headers:
+      - "#SBATCH --ntasks-per-node=4"
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"
