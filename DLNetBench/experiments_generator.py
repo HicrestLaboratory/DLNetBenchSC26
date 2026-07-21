@@ -1461,7 +1461,7 @@ def print_baseline_set(cfg: argparse.Namespace, baseline: list[SingleRun]) -> No
     for run in baseline:
         by_strategy.setdefault(run.strategy.name, []).append(run.gpus)
     for name, gpus in by_strategy.items():
-        print(f"  {name:20s}  gpus = {sorted(gpus)}")
+        print(f"  {name:20s}  gpus = {sorted([int(g) for g in gpus])}")
 
 
 def print_baseline_set_topology(
@@ -2087,5 +2087,4 @@ if __name__ == "__main__":
     _args = _parser.parse_args()
     _validate_args(_args, _parser)
     override_args_values(_args)
-    print(f"STRATEGY_PLACEMENT_MAP: {STRATEGY_PLACEMENT_MAP}")
     main(_args)

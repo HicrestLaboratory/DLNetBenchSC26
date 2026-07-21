@@ -1,18 +1,17 @@
 sequential: true
 
 variables:
-  nodes: [330]                # Ensure these are enough for the experiments that will run
-  system: ['alps_clariden']   # Does not matter if placement != runtime
+  nodes:  [32]                # Ensure these are enough for the experiments that will run
+  system: ['leonardo']        # Does not matter if placement != runtime
   tasks_per_node: [4]
-  cpus_per_task: [72]
+  cpus_per_task: [8]
 
-  # -- Change as needed --
-  experiment: "experiments_alps/"
+  experiment: "ae/" # Change as needed. This shall point to the output directory of the experiments expansion
 
-  extra_flags: ["--debug --keep-files --no-compact"] 
+  extra_flags: ["--debug --keep-files --no-compact"] # Keep these 3 args
   # Add if needed: --nodes-blacklist <list in SLURM format>
 
-  walltime: [200]
+  walltime: [200] # 200s. Can be tuned as needed 
 
 jobs:
   - config: "{nodes}_nodes"

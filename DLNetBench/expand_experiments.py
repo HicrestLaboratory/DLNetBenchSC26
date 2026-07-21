@@ -200,10 +200,10 @@ RUNTIME_ESTIMATES = {
     
     'alps__DP+PP+TP__224__H200':            72.094135,
     'alps__DP+PP+TP__256__H200':            72.666106,
-    'alps__DP+PP+TP__512__H200':            72.666106, # not real
+    'alps__DP+PP+TP__512__H200':            72.666106, # estimated
     
     'alps__DP+PP+Expert__512__H200':        84.212112,
-    'alps__DP+PP+Expert__1024__H200':       84.212112, # not real
+    'alps__DP+PP+Expert__1024__H200':       84.212112, # estimated
     
      # Jupiter
     'jupiter__DP__8__GH200':                 14.117437, # old compute 13.97558,
@@ -221,7 +221,7 @@ RUNTIME_ESTIMATES = {
     'jupiter__DP+PP+TP__512__GH200':         44.309712, # old compute 39.810219,
 
     'jupiter__DP+PP+Expert__512__GH200':     81.942664, # old compute 64.043106,
-    'jupiter__DP+PP+Expert__1024__GH200':    81.942664, # old compute 64.043106, # not real
+    'jupiter__DP+PP+Expert__1024__GH200':    81.942664, # old compute 64.043106, estimated
 }
 
 MIN_CONCURRENT_RUNTIME = 170 # FIXME
@@ -626,23 +626,23 @@ def main(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Estimate total runtime
-    runtimes = defaultdict(dict)
-    for meta, runtime in RUNTIME_ESTIMATES.items():
-        system, strategy, gpus, compute = meta.split('__')
-        runtimes[f'{system}__{compute}'][f'{strategy}__{int(gpus)}'] = runtime
+    # runtimes = defaultdict(dict)
+    # for meta, runtime in RUNTIME_ESTIMATES.items():
+    #     system, strategy, gpus, compute = meta.split('__')
+    #     runtimes[f'{system}__{compute}'][f'{strategy}__{int(gpus)}'] = runtime
     
-    for sys_compute, est_runtimes in runtimes.items():
-        #estimates = estimate_experiment_times(records, baselines, est_runtimes, args.small_job_threshold)
-        print(f"\n\033[36m{'='*72}")
-        print(f"RUNTIME ESTIMATION for {sys_compute}")
-        print(f"{'='*72}\033[0m")
-        #print(f"  Total Baseline (Sequential), #runs={len(estimates['baseline_times']):<3}  : {estimates['baseline_mins']:.2f} minutes")
-        #print(f"  Total Concurrent Execution,  #runs={len(estimates['concurrent_times']):<3}  : {estimates['concurrent_mins']:.2f} minutes")
-        print(f"{'-'*72}")
-        #print(f"  Baseline times   (seconds): {estimates['baseline_times']}")
-        #print(f"  Concurrent times (seconds): {estimates['concurrent_times'][0]} and {len(estimates['concurrent_times'])-1} more")
-        print(f"{'-'*72}")
-        print()
+    # for sys_compute, est_runtimes in runtimes.items():
+    #     estimates = estimate_experiment_times(records, baselines, est_runtimes, args.small_job_threshold)
+    #     print(f"\n\033[36m{'='*72}")
+    #     print(f"RUNTIME ESTIMATION for {sys_compute}")
+    #     print(f"{'='*72}\033[0m")
+    #     print(f"  Total Baseline (Sequential), #runs={len(estimates['baseline_times']):<3}  : {estimates['baseline_mins']:.2f} minutes")
+    #     print(f"  Total Concurrent Execution,  #runs={len(estimates['concurrent_times']):<3}  : {estimates['concurrent_mins']:.2f} minutes")
+    #     print(f"{'-'*72}")
+    #     print(f"  Baseline times   (seconds): {estimates['baseline_times']}")
+    #     print(f"  Concurrent times (seconds): {estimates['concurrent_times'][0]} and {len(estimates['concurrent_times'])-1} more")
+    #     print(f"{'-'*72}")
+    #     print()
 
     # ── Resolve placement mode ───────────────────────────────────────────────
     if args.placement_mode is None:

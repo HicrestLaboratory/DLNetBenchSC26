@@ -1,3 +1,6 @@
 *.json
-SbatchMan/
 __pycache__/
+
+**/SbatchMan/
+**/workerpool_out/
+**/ae/
