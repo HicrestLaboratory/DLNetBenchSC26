@@ -1,9 +1,10 @@
 #!/bin/bash
 
-git submodule init
-git submodule update
+cd common
+[[ ! -d JobPlacer ]] && git clone https://github.com/HicrestLaboratory/JobPlacer.git
+[[ ! -d ccutils ]] && git clone https://github.com/ThomasPasquali/ccutils.git
 
-cd common/JobPlacer
+cd JobPlacer
 git checkout SC26
 cargo build --release
 
@@ -13,5 +14,7 @@ if [[ -z "$CCUTILS_INCLUDE" ]]; then
     wget -qO- https://raw.githubusercontent.com/ThomasPasquali/ccutils/ccutils_json/install.sh | env bash
 fi
 
-cd ../../DLNetBench/DLNetBench
+cd ../../DLNetBench/
+git clone https://github.com/HicrestLaboratory/DLNetBench.git
+cd DLNetBench
 git checkout SC26

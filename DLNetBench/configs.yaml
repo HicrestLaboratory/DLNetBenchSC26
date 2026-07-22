@@ -89,9 +89,9 @@ alps_clariden:
 
   default_conf:
     account: "g220"
-    reservation: "PA-2851"
+    # reservation: "PA-2851"
     cpus_per_task: 72
-    time: "00:04:00"
+    time: "00:05:00"
     partition: "normal"
     exclude:
       - "nid006120"
