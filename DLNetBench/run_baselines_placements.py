@@ -121,7 +121,7 @@ SYSTEM_CONFIGS: dict[str, dict] = {
         "cluster_name":  "alps_clariden",
         "partition":     "normal",
         "account":       "g220",
-        "reservation":   "PA-2851",
+        # "reservation":   "PA-2851",
         "cpus_per_task": 72,
         "time":          "00:05:00",
         "gpus":          4,
