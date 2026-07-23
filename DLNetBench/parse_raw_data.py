@@ -47,7 +47,7 @@ from utils.slurm import expand_slurm_nodelist
 from JobPlacer.cli_wrapper import JobPlacer
 import shutil
 
-SYSTEMS = ["jupiter", "leonardo", "nvl72", "alps", "dgxA100", "lumi"] # , "intel"]
+SYSTEMS = ["jupiter", "leonardo", "nvl72", "alps_clariden", "dgxA100", "lumi"] # , "intel"]
 SBM_SYSTEM_NAME_MAP = {"dgxA100": "baldo", "intel": "enea"}
 
 SBM_SYSTEM_ARCHIVES = {
@@ -368,11 +368,11 @@ def get_job_placer(system: str) -> Union[JobPlacer, None]:
     if system not in PLACERS_CACHE:
         topology_file=f'../common/JobPlacer/{system}_topo.txt'
         sinfo_file=f'../common/JobPlacer/{system}_sinfo.txt'
-        if system == 'lumi':
+        topology_toml_file=None
+        
+        if system.lower() in ['lumi', 'alps']:
             topology_file = None
             sinfo_file = None
-        topology_toml_file=None
-        if system.lower() in ['lumi', 'alps']:
             topology_toml_file=f'../common/JobPlacer/systems/{system.upper()}.toml'
             
         PLACERS_CACHE[system] = JobPlacer(

@@ -19,6 +19,7 @@ GPUS_PER_NODE_MAP = {
     'jupiter':      4,
     'leonardo':     4,
     'nvl72':        4,
+    'alps':         4,
     'alps_clariden':4,
     'lumi':         8,
     'intel':        8,
