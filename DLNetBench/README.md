@@ -236,9 +236,9 @@ python expand_experiments.py experiments_jupiter_3_groups_uniform.json --placeme
 ### LUMI
 
 ```bash
-# Baselines
-python experiments_generator.py -G $((512*8))   --util-min 0.8   --util-max 1.0   --n-stochastic-patterns 5   --max-experiments 12   --n-samples-per-bin 1   --n-placement-samples-per-bin 1   --k-max 10   --placement-bin-med-hi 2.55 --baseline-extended --use-topology --output-json lumi_baseline.json --topo-q2 $((8*16)) --topo-q3 $((8*16*120)) --topo-q1 8
-# missing generator command for `lumi_single_node.json`
+python experiments_generator.py -G $((320*8))   --util-min 0.8   --util-max 1.0   --n-stochastic-patterns 5   --max-experiments 12   --n-samples-per-bin 1   --n-placement-samples-per-bin 1   --k-max 100   --placement-bin-med-hi 2.55 --use-topology --baseline-extended --output-json lumi_baselines.json --topo-q2 $((8*16)) --topo-q3 $((8*16*123)) --topo-q1 8 --g-min 16
 
-python run_baselines_no_placement.py lumi_single_node.json --dgx DGX_A100 --comm-lib rccl --gpu-model MI250X --dry-run  --system lumi --gpus-per-node 8
+python expand_experiments.py lumi_powerlaw.json --placement-mode hardcoded --system lumi --comm-lib rccl --gpu-model MI250X --gpus-per-node 8 --output-dir lumi_powerlaw_test --reserved-nodes "nid[005124-005125,005127-005242,005244-005254,005256-005279,005281,005283,005285,005287,005289,005291,005293,005295-005422,005424-005432,005434-005495]"
+
+python run_baselines_placements.py lumi_baseline.json --system lumi --comm-lib rccl --gpu-model MI250X --gpus-per-node 8 --dry-run --nodelist "nid00[5868-5918,5920-5950,5952-6099,6101-6239]" --cpus-per-task 7
 ```
