@@ -570,7 +570,7 @@ def plot_slowdown_violinplot(
 
     # ── Decorations ───────────────────────────────────────────────────────────
     ax.axhline(1.0, color="black", ls="--", lw=1, alpha=0.8)
-    ax.set_ylim(-5.0, y_clip)
+    ax.set_ylim(-30.0, 150.0)
     _annotate_clipped(ax, categories, slowdowns, y_clip=y_clip)
     _setup_grouped_xaxis(ax, categories, groups, system)
     ax.set_ylabel("Slowdown $\\sigma$", fontsize=20)

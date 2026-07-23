@@ -95,17 +95,12 @@ def get_system_jobs(system: str) -> List[sbm.Job]:
     
     
 def parse_proxy_stdout_data(stdout: Union[str, Path], gpus: int) -> Union[None, RunMeasurements]:
-    try:
-        df_dict, _ = (
-            stdout_to_csv_multi(stdout, return_dataframes=True)
-            if isinstance(stdout, str)
-            else stdout_file_to_csv_multi(stdout, return_dataframes=True)
-        )
-        return RunMeasurements.from_df_dict(df_dict, n_ranks=gpus) if 'main' in df_dict else None
-    except Exception as e:
-        print(f'COULD NOT PARSE JOB: {e}')
-    
-    return None
+    df_dict, _ = (
+        stdout_to_csv_multi(stdout, return_dataframes=True)
+        if isinstance(stdout, str)
+        else stdout_file_to_csv_multi(stdout, return_dataframes=True)
+    )
+    return RunMeasurements.from_df_dict(df_dict, n_ranks=gpus) if 'main' in df_dict else None
     
                     
 
