@@ -1,8 +1,9 @@
 #!/bin/bash
 
 cd common
-[[ ! -d JobPlacer ]] && git clone https://github.com/HicrestLaboratory/JobPlacer.git
-[[ ! -d ccutils ]] && git clone https://github.com/ThomasPasquali/ccutils.git
+
+git clone https://github.com/HicrestLaboratory/JobPlacer.git
+git clone https://github.com/ThomasPasquali/ccutils.git
 
 cd JobPlacer
 git checkout SC26
