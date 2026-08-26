@@ -536,6 +536,17 @@ class Baseline:
         """
         return self.data.get_comm_relevance() if self.data else None
     
+    def get_placement_class_from_alloc_stats(self):
+        if self.allocation_stats:
+            if len(self.allocation_stats.jobs) != 1:
+                print("WARNING: jobs count in baseline allocation stats != 1")
+                print(self.allocation_stats.jobs)
+                return None
+            return parse_placement(self.allocation_stats.jobs['baseline'].placement_class)
+        
+        return None
+        
+    
     
 @dataclass
 class SlowdownStats:
@@ -587,15 +598,18 @@ class ConcurrentRun:
     placements: List[Placement]
     
     allocation_stats: Union[PlacementStats, None]
+    script_reservation: Optional[str]
+    
+    # def get_placements_from_allocation_stats(self):
+    #     return [parse_placement(j.placement_class) for j in self.allocation_stats.jobs.values()] if self.allocation_stats else []
     
     def is_in_reservation(self) -> bool:
-        # FIXME this is specific for what we have
-        # TODO make sure is correct
-        by_system = self.system in ['leonardo', 'jupiter', 'intel', 'dgxA100', 'nvl72']
-        less_than_three_groups = None
+        by_system = self.system in ['leonardo', 'jupiter', 'intel', 'dgxA100', 'nvl72', 'alps_clariden', 'lumi']
+        leq_three_groups = None
         if self.allocation_stats:
-            less_than_three_groups = len(self.allocation_stats.distinct_groups) < 3
-        return by_system and (less_than_three_groups is None or less_than_three_groups)
+            leq_three_groups = len(self.allocation_stats.distinct_groups) <= 3
+        resrv_in_script = self.script_reservation is not None
+        return by_system and resrv_in_script and (leq_three_groups is None or leq_three_groups)
     
     def _summarize_pattern(self) -> str:
         """Summarize the pattern list as a compact string (e.g., '2x8' for [8,8])."""

@@ -95,12 +95,16 @@ def get_system_jobs(system: str) -> List[sbm.Job]:
     
     
 def parse_proxy_stdout_data(stdout: Union[str, Path], gpus: int) -> Union[None, RunMeasurements]:
+    # try:
     df_dict, _ = (
         stdout_to_csv_multi(stdout, return_dataframes=True)
         if isinstance(stdout, str)
         else stdout_file_to_csv_multi(stdout, return_dataframes=True)
     )
     return RunMeasurements.from_df_dict(df_dict, n_ranks=gpus) if 'main' in df_dict else None
+    # except Exception as e:
+    #     print(f"WARNING: could not parse output. {e}")
+    #     return None
     
                     
 
@@ -190,7 +194,6 @@ def parse_baselines(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str,
                         _, nodes = l.split(': ')
                         nodes = expand_slurm_nodelist(nodes)
                         allocations['baseline'] = nodes
-                # print(allocations)
                 # if not allocations:
                 #     print('\n'.join(stdout.splitlines()[:40]))
                 if allocations:
@@ -362,7 +365,7 @@ OUTCOME_EXCEPTION = "exception"
 PLACERS_CACHE = {}
 
 def get_job_placer(system: str) -> Union[JobPlacer, None]:
-    if system not in ['leonardo', 'jupiter', 'alps', 'lumi']:
+    if system not in ['leonardo', 'jupiter', 'alps_clariden', 'alps_daint', 'lumi']:
         return None
     
     if system not in PLACERS_CACHE:
@@ -370,7 +373,7 @@ def get_job_placer(system: str) -> Union[JobPlacer, None]:
         sinfo_file=f'../common/JobPlacer/{system}_sinfo.txt'
         topology_toml_file=None
         
-        if system.lower() in ['lumi', 'alps']:
+        if system.lower() in ['lumi', 'alps_clariden', 'alps_daint']:
             topology_file = None
             sinfo_file = None
             topology_toml_file=f'../common/JobPlacer/systems/{system.upper()}.toml'
@@ -384,6 +387,13 @@ def get_job_placer(system: str) -> Union[JobPlacer, None]:
         
     return PLACERS_CACHE[system]
 
+def extract_reservation(sbatch_script_text: str) -> str | None:
+    # Matches --reservation=val, --reservation val, and optional quotes
+    pattern = r'--reservation(?:=|\s+)(["\']?)(?P<reservation>[^\s#"\']+)\1'
+
+    match = re.search(pattern, sbatch_script_text, re.MULTILINE)
+    return match.group("reservation") if match else None
+
 def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str, List[ConcurrentRun]]:
     """
     Parse all concurrent-execution stdout files from the workerpool output.
@@ -394,6 +404,11 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
     for system in systems:
         print(f'  Loading system: {system}')
         jobs = get_system_jobs(system)
+        
+        is_daint = False
+        if system == 'alps':
+            is_daint = True
+            system = 'alps_clariden'
         
         # Summary bookkeeping
         # issues: list of (sbm_job_id, uid, outcome, detail)
@@ -424,6 +439,11 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                 print(job)
                 continue
             
+            script_reservation = None
+            if job.get_job_script_path().exists():
+                with open(job.get_job_script_path(), "r") as f:
+                    script_reservation = extract_reservation(f.read())
+            
             try:
                 runs, lines = parse_scheduler_output(stdout)
                 placement_strategy = None                
@@ -439,7 +459,7 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                 
                 allocation_stats = None
                 if placement_strategy != 'device':
-                    placer = get_job_placer(system)
+                    placer = get_job_placer(system if not is_daint else 'alps_daint')
                     if placer:
                         allocations = {}
                         for l in lines:
@@ -501,7 +521,12 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                     exit(1)
                 strategy, gpus, nodes, placement_class, rep = m.groups()
                 strategies.append(Strategy(strategy))
-                placement_classes.append(parse_placement(placement_class))
+                pc = parse_placement(placement_class)
+                # If placement was not enforced, derive it from the allocated nodes
+                if pc == Placement.NA and allocation_stats and allocation_stats.jobs:
+                    pc = parse_placement(allocation_stats.jobs[r['uid'].split('_rep')[0]].placement_class)
+                placement_classes.append(pc)
+
                 
             is_placement_device = placement_strategy == 'device'
             if is_placement_device:
@@ -513,7 +538,7 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                 pattern = [p* GPUS_PER_NODE_MAP[system] for p in pattern]
                 
             concurrent_run = ConcurrentRun(
-                system=job.cluster_name,
+                system=system,
                 job_id=job.job_id,
                 tag=job.tag,
                 tot_runtime=job.get_run_time(),
@@ -523,6 +548,7 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                 nodes=nodes,
                 gpus=gpus,
                 allocation_stats=allocation_stats,
+                script_reservation=script_reservation
             )
             
             if concurrent_run.gpus / sum(pattern) < 0.8:
@@ -540,6 +566,10 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                     exit(1)
                 strategy, gpus, nodes, placement_class, rep = m.groups()
                 model = get_model_from_command(run["app"])
+                placement_class = parse_placement(placement_class)
+                # If placement was not enforced, derive it from the allocated nodes
+                if placement_class == Placement.NA and allocation_stats and allocation_stats.jobs:
+                    placement_class = parse_placement(allocation_stats.jobs[run['uid'].split('_rep')[0]].placement_class)
 
                 # --- exit code check ---
                 if not run["success"]:
@@ -569,7 +599,7 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                             strategy=Strategy(strategy),
                             model=Model(model),
                             gpus=int(gpus),
-                            placement_class=parse_placement(placement_class)
+                            placement_class=placement_class
                         )].append(measurements)
                         
                         n_ok      += 1
@@ -578,7 +608,7 @@ def parse_concurrent(systems=SYSTEMS, generate_placement_svgs=False) -> Dict[str
                         n_no_data += 1
                     except Exception as e:
                         n_bad_csv += 1
-                        if str(e) not in ['No ccutils sections found in stdout', 'Section \'dp\' has no END marker']:
+                        if str(e) not in ['No ccutils sections found in stdout', 'Section \'dp\' has no END marker', 'Section \'dp_pp_tp\' has no END marker', 'Section \'dp_pp\' has no END marker']:
                             print('PARSE ERROR:')
                             print(e)
                             raise e
@@ -708,6 +738,8 @@ def compute_slowdowns(
                 merged_concurrent: Optional[MeasurementStats] = None
                 n_merged = 0
                 for m_i, measure in enumerate(runs):
+                    if measure is None:
+                        continue
                     t = measure.get_throughput()
                     if not t:
                         no_throughput.add((key, m_i))
