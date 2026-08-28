@@ -1,0 +1,21 @@
+variables:
+  nodes: [1, 2, 4]
+
+alps_clariden:
+  scheduler: slurm
+
+  default_conf:
+    account: "g220"
+    partition: "debug"
+    cpus_per_task: 72
+    time: "00:02:00"
+    gpus: 4
+    # exclusive: true
+    custom_headers:
+      - "#SBATCH --uenv=prgenv-gnu/26.3:v1"
+      - "#SBATCH --view=default"
+      - "#SBATCH --ntasks-per-node=4"
+
+  configs:
+    - name: "{nodes}_nodes"
+      nodes: "{nodes}"

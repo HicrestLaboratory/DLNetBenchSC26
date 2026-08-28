@@ -1,0 +1,19 @@
+configs: "configs.yaml"
+
+variables:
+  nodes: [1, 2, 4]
+  program: ['ar', 'ar_iter_barr']
+  tasks_per_node:
+    per_cluster:
+      alps_clariden: [4]
+      lumi: [8]
+  extra_srun_args:
+    default: ['']
+    per_cluster:
+      alps_clariden: ['--mpi=cray_shasta --accel-bind=g']
+
+jobs:
+  - config: "{nodes}_nodes"
+    config_jobs:
+      - tag: "{program}_{nodes}"
+        command: "srun -N{nodes} -n$(({nodes}*{tasks_per_node})) --ntasks-per-node={tasks_per_node} {extra_srun_args} ./{program}"
